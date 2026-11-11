@@ -15,17 +15,27 @@ Features:
 
 import os
 import sys
+
+# Ensure virtual environment site-packages are accessible even when invoked via system python
+_venv_site = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "lib", "python3.11", "site-packages")
+if os.path.exists(_venv_site) and _venv_site not in sys.path:
+    sys.path.insert(0, _venv_site)
+
 import threading
 import time
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 
 def start_health_servers():
-    """Start HTTP health servers on PORT, 10000, 8000, and 7860 to ensure instant port binding on Render."""
-    primary_port = int(os.environ.get("PORT", 10000))
-    ports_to_bind = [primary_port]
-    for fallback in [10000, 8000, 7860]:
-        if fallback not in ports_to_bind:
-            ports_to_bind.append(fallback)
+    """Start HTTP health server for cloud hosting (Render / HF) on PORT or single fallback port 10000."""
+    port_env = os.environ.get("PORT")
+    if port_env:
+        try:
+            ports_to_bind = [int(port_env)]
+        except ValueError:
+            ports_to_bind = [10000]
+    else:
+        # Default single health port when running locally or unconfigured
+        ports_to_bind = [int(os.environ.get("HEALTH_PORT", 10000))]
 
     class HealthStatusHandler(SimpleHTTPRequestHandler):
         def do_GET(self):
@@ -62,13 +72,19 @@ def start_health_servers():
         def log_message(self, format, *args):
             pass
 
+    class ReusableHTTPServer(HTTPServer):
+        allow_reuse_address = True
+
     for p in ports_to_bind:
         def make_server(port_num):
             try:
-                server = HTTPServer(("0.0.0.0", port_num), HealthStatusHandler)
-                print(f"[HEALTH SERVER] Instant web server active on 0.0.0.0:{port_num} (ready for Render / UptimeRobot)", flush=True)
+                server = ReusableHTTPServer(("0.0.0.0", port_num), HealthStatusHandler)
+                print(f"[HEALTH SERVER] Health server listening on 0.0.0.0:{port_num}", flush=True)
                 server.serve_forever()
-            except Exception as ex:
+            except OSError:
+                # Port already bound or not available, fail quietly without spamming
+                pass
+            except Exception:
                 pass
 
         threading.Thread(target=make_server, args=(p,), daemon=True).start()
@@ -86,6 +102,13 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
 import cv2
 import numpy as np
+from emoji_helper import (
+    has_emojis,
+    get_apple_emoji_image,
+    measure_line_with_emojis,
+    draw_text_with_emojis,
+    get_font_cap_metrics
+)
 # NOTE: rembg and onnxruntime are lazy-loaded on demand to keep baseline memory lean (<100MB)
 import requests
 import instaloader
@@ -103,12 +126,14 @@ import json
 # Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.DEBUG
+    level=logging.INFO
 )
 logger = logging.getLogger("textbox_bot")
 
 # Global high-performance caches for real-time 3D positioning
 REMBG_SESSION = None
+REMBG_LOCK = threading.Lock()
+
 def get_rembg_session():
     global REMBG_SESSION
     if REMBG_SESSION is None:
@@ -119,8 +144,6 @@ def get_rembg_session():
         except Exception as e:
             logger.error(f"Failed to create rembg session: {e}")
     return REMBG_SESSION
-
-
 
 CUTOUT_CACHE = {}
 BG_CROPPED_CACHE = {}
@@ -191,7 +214,8 @@ def compute_and_cache_cutout(bg_image_path: str, target_h: int):
         bg_enhanced = enhance_image_quality(bg_img)
         session = get_rembg_session()
         from rembg import remove
-        cutout = remove(bg_enhanced, session=session)
+        with REMBG_LOCK:
+            cutout = remove(bg_enhanced, session=session)
         bg_aspect = bg_enhanced.width / bg_enhanced.height
         target_aspect = 1080 / target_h
         if bg_aspect > target_aspect:
@@ -203,8 +227,9 @@ def compute_and_cache_cutout(bg_image_path: str, target_h: int):
             top = (bg_enhanced.height - new_h) // 2
             crop_box = (0, top, bg_enhanced.width, top + new_h)
         cutout_cropped = cutout.crop(crop_box).resize((1080, target_h), Image.Resampling.LANCZOS)
-        if len(CUTOUT_CACHE) > 10:
-            CUTOUT_CACHE.clear()
+        if len(CUTOUT_CACHE) >= 20:
+            oldest_key = next(iter(CUTOUT_CACHE))
+            CUTOUT_CACHE.pop(oldest_key, None)
         CUTOUT_CACHE[cutout_cache_key] = cutout_cropped
         logger.info(f"Background cutout generated and cached for {bg_image_path}")
         return cutout_cropped
@@ -222,15 +247,28 @@ def warmup_cutout_cache(bg_image_path: str, png_bytes: bytes, line_bottom: int =
     except Exception as e:
         logger.error(f"Error in warmup_cutout_cache: {e}")
 
-def save_user_session(user_id, chosen_font, chosen_color=None, doge_highlight_lines=None):
+def save_user_session(user_id, chosen_font=None, chosen_color=None, doge_highlight_lines=None, last_text=None, line_bottom=None):
     try:
         session_file = os.path.join(BASE_DIR, "scratch", f"session_{user_id}.json")
         os.makedirs(os.path.dirname(session_file), exist_ok=True)
-        data = {
-            "chosen_font": chosen_font,
-            "chosen_color": chosen_color,
-            "doge_highlight_lines": doge_highlight_lines
-        }
+        data = {}
+        if os.path.exists(session_file):
+            try:
+                with open(session_file, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        if chosen_font is not None:
+            data["chosen_font"] = chosen_font
+        if chosen_color is not None:
+            data["chosen_color"] = chosen_color
+        if doge_highlight_lines is not None:
+            data["doge_highlight_lines"] = doge_highlight_lines
+        if last_text is not None:
+            data["last_text"] = last_text
+        if line_bottom is not None:
+            data["line_bottom"] = line_bottom
+            
         with open(session_file, "w") as f:
             json.dump(data, f)
         logger.info(f"Saved session for user {user_id}: {data}")
@@ -253,12 +291,18 @@ def restore_session_if_needed(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not update or not update.effective_user:
         return
     user_id = update.effective_user.id
-    if not context.user_data.get("chosen_font"):
-        session = load_user_session(user_id)
-        if session:
+    session = load_user_session(user_id)
+    if session:
+        if not context.user_data.get("chosen_font") and session.get("chosen_font"):
             context.user_data["chosen_font"] = session.get("chosen_font")
+        if not context.user_data.get("chosen_color") and session.get("chosen_color"):
             context.user_data["chosen_color"] = session.get("chosen_color")
+        if context.user_data.get("doge_highlight_lines") is None and session.get("doge_highlight_lines") is not None:
             context.user_data["doge_highlight_lines"] = session.get("doge_highlight_lines")
+        if not context.user_data.get("last_text") and session.get("last_text"):
+            context.user_data["last_text"] = session.get("last_text")
+        if context.user_data.get("line_bottom") is None and session.get("line_bottom") is not None:
+            context.user_data["line_bottom"] = session.get("line_bottom")
 
 def fetch_instagram_post(url: str, user_id: int):
     """
@@ -395,6 +439,10 @@ def get_realesrgan_session():
         return None
 
     if REALESRGAN_SESSION is None:
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            return None
         model_paths = [
             os.path.join(BASE_DIR, "resources", "RealESRGAN_x4plus.onnx"),
             os.path.join(BASE_DIR, "resources", "realesr-general-x4v3.onnx"),
@@ -522,15 +570,17 @@ def proofread_text_with_ai(text: str) -> str:
         prompt = (
             "You are an expert copyeditor. Fix any spelling, punctuation, or grammatical errors in the text below. "
             "Do NOT change the meaning or style. Keep the original text structure and line breaks where appropriate. "
+            "CRITICAL: If any emojis are present in the text, you MUST PRESERVE all emojis in their exact positions. "
+            "Do NOT remove, replace, or reorder any emojis. "
             "Do NOT add any introductory or concluding comments. Return ONLY the final corrected text.\n\n"
             f"Text to correct:\n{text}"
         )
-        models_to_try = [
-            os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+        models_to_try = list(dict.fromkeys([
+            os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            "llama-3.3-70b-versatile",
             "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-            "llama-3.3-70b-versatile"
-        ]
+            "openai/gpt-oss-20b"
+        ]))
         for model_name in models_to_try:
             payload = {
                 "model": model_name,
@@ -539,7 +589,7 @@ def proofread_text_with_ai(text: str) -> str:
                 ]
             }
             try:
-                response = requests.post(url, headers=headers, json=payload, timeout=8)
+                response = requests.post(url, headers=headers, json=payload, timeout=5)
                 if response.status_code == 200:
                     res_data = response.json()
                     content = res_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
@@ -556,6 +606,8 @@ def proofread_text_with_ai(text: str) -> str:
         prompt = (
             "You are an expert copyeditor. Fix any spelling, punctuation, or grammatical errors in the text below. "
             "Do NOT change the meaning or style. Keep the original text structure and line breaks where appropriate. "
+            "CRITICAL: If any emojis are present in the text, you MUST PRESERVE all emojis in their exact positions. "
+            "Do NOT remove, replace, or reorder any emojis. "
             "Do NOT add any introductory or concluding comments. Return ONLY the final corrected text.\n\n"
             f"Text to correct:\n{text}"
         )
@@ -611,12 +663,25 @@ def is_ai_refusal(text: str) -> bool:
         return True
     return False
 
-def generate_charlie_caption(image_bytes: bytes = None, text_content: str = "") -> str:
+def generate_post_caption(template_type: str = "charlie", image_bytes: bytes = None, text_content: str = "") -> str:
     """
-    Generates an Instagram caption for Charlie Kirk posts using Gemini vision or Groq fallback.
-    Prompt: 'write a 5 sentence 5 hashtag caption for this Instagram post from the conservative perspective'
+    Generates an Instagram caption for Charlie Kirk or Supporting MAGA posts using Gemini vision or Groq fallback.
     """
-    prompt = "write a 5 sentence 5 hashtag caption for this Instagram post from the conservative perspective"
+    is_maga = template_type.lower() in ("maga", "supporting_maga")
+    if is_maga:
+        prompt = "write a 5 sentence 5 hashtag caption for this Instagram post from the conservative MAGA America First perspective"
+        system_content = (
+            "You are an expert social media copywriter for conservative MAGA and America First political commentary and news posts on Instagram. "
+            "Do not include meta-commentary, introductory text, or explanations like 'Here is the caption:'. "
+            "Output only the final 5-sentence caption and 5 hashtags."
+        )
+    else:
+        prompt = "write a 5 sentence 5 hashtag caption for this Instagram post from the conservative perspective"
+        system_content = (
+            "You are an expert social media copywriter for conservative political commentary and news posts on Instagram. "
+            "Do not include meta-commentary, introductory text, or explanations like 'Here is the caption:'. "
+            "Output only the final 5-sentence caption and 5 hashtags."
+        )
     
     # 1. Try Gemini API with image if key available
     api_key = os.getenv("GEMINI_API_KEY")
@@ -656,7 +721,6 @@ def generate_charlie_caption(image_bytes: bytes = None, text_content: str = "") 
     # 2. Try Groq API fallback
     groq_key = os.getenv("GROQ_API_KEY")
     if groq_key:
-        # Prioritize qwen first as it reliably handles conservative political commentary without refusal
         models_to_try = [
             "qwen/qwen3.8-27b",
             "openai/gpt-oss-120b",
@@ -683,11 +747,7 @@ def generate_charlie_caption(image_bytes: bytes = None, text_content: str = "") 
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "You are an expert social media copywriter for conservative political commentary and news posts on Instagram. "
-                            "Do not include meta-commentary, introductory text, or explanations like 'Here is the caption:'. "
-                            "Output only the final 5-sentence caption and 5 hashtags."
-                        )
+                        "content": system_content
                     },
                     {"role": "user", "content": user_msg}
                 ],
@@ -708,6 +768,15 @@ def generate_charlie_caption(image_bytes: bytes = None, text_content: str = "") 
                 logger.error(f"Error calling Groq model {g_model} for caption: {e}")
 
     # Safe hardcoded fallback if all AI services fail
+    if is_maga:
+        return (
+            "Standing strong for our principles and putting America First. "
+            "Every patriot has a voice, and together we can protect faith, family, and freedom. "
+            "Common sense and truth will always prevail when good people stand united. "
+            "We must remain vigilant and never surrender the values that made this nation great. "
+            "Join the movement today and make your voice heard across America.\n\n"
+            "#MAGA #AmericaFirst #Conservative #Trump #Freedom"
+        )
     return (
         "Standing strong for our principles and the future of America. "
         "Every citizen has a voice, and together we can protect faith, family, and freedom. "
@@ -716,6 +785,14 @@ def generate_charlie_caption(image_bytes: bytes = None, text_content: str = "") 
         "Join the movement today and make your voice heard across the country.\n\n"
         "#Conservative #CharlieKirk #AmericaFirst #Freedom #Truth"
     )
+
+def generate_charlie_caption(image_bytes: bytes = None, text_content: str = "") -> str:
+    """Wrapper for Charlie Kirk caption generation."""
+    return generate_post_caption("charlie", image_bytes=image_bytes, text_content=text_content)
+
+def generate_maga_caption(image_bytes: bytes = None, text_content: str = "") -> str:
+    """Wrapper for Supporting MAGA caption generation."""
+    return generate_post_caption("maga", image_bytes=image_bytes, text_content=text_content)
 
 async def safe_reply_caption(target_message, caption_text: str):
     """Safely sends the generated Instagram caption directly without headers or footers for easy copying."""
@@ -982,6 +1059,7 @@ def generate_textbox_image(text: str, font_type: str, highlight_choice: str = "y
     line_widths = []
     line_heights = []
     line_bboxes = []
+    line_measured_info = []
     
     # Font sizing constraints to prevent excessive scaling
     max_font_size = 9999
@@ -995,8 +1073,11 @@ def generate_textbox_image(text: str, font_type: str, highlight_choice: str = "y
                 base_font = ImageFont.truetype(font_path, base_size)
             else:
                 base_font = ImageFont.load_default(size=base_size)
-            bbox = temp_draw.textbbox((0, 0), line, font=base_font)
-            base_w = bbox[2] - bbox[0]
+            if has_emojis(line):
+                base_w, _, _, _ = measure_line_with_emojis(temp_draw, line, base_font)
+            else:
+                bbox = temp_draw.textbbox((0, 0), line, font=base_font)
+                base_w = bbox[2] - bbox[0]
             if base_w > 0:
                 estimated_size = int(base_size * (target_text_width / base_w))
             else:
@@ -1017,8 +1098,17 @@ def generate_textbox_image(text: str, font_type: str, highlight_choice: str = "y
             except Exception:
                 line_font = ImageFont.load_default()
             
-        bbox = temp_draw.textbbox((0, 0), line, font=line_font)
-        line_w = bbox[2] - bbox[0]
+        if has_emojis(line):
+            line_w, seg_data, cap_top, cap_h = measure_line_with_emojis(temp_draw, line, line_font)
+            line_measured_info.append((line_w, seg_data, cap_top, cap_h))
+            bbox = temp_draw.textbbox((0, 0), line, font=line_font)
+            if bbox[2] <= bbox[0]:
+                bbox = (0, cap_top, int(line_w), cap_top + cap_h)
+        else:
+            bbox = temp_draw.textbbox((0, 0), line, font=line_font)
+            line_w = bbox[2] - bbox[0]
+            line_measured_info.append(None)
+            
         line_h = get_line_height(line_font)
         
         fonts.append(line_font)
@@ -1259,16 +1349,20 @@ def generate_textbox_image(text: str, font_type: str, highlight_choice: str = "y
         line = lines[i]
         font = fonts[i]
         color = line_colors[i]
+        measured_item = line_measured_info[i]
         
-        # Use precise bounding box to avoid cutting off the edges
-        bbox = box_draw.textbbox((0, 0), line, font=font)
-        left, top, right, bottom = bbox
-        w = right - left
-        
-        # Center text horizontally using exact bounds
-        x = box_x + padding - left + (target_text_width - w) // 2
-        
-        box_draw.text((x, current_y), line, font=font, fill=color)
+        if measured_item is not None:
+            line_w = line_widths[i]
+            x = box_x + padding + (target_text_width - int(line_w)) // 2
+            draw_text_with_emojis(box_draw, box_overlay, x, current_y, line, font=font, fill=color, measured_data=measured_item)
+        else:
+            # Use precise bounding box to avoid cutting off the edges
+            bbox = box_draw.textbbox((0, 0), line, font=font)
+            left, top, right, bottom = bbox
+            w = right - left
+            # Center text horizontally using exact bounds
+            x = box_x + padding - left + (target_text_width - w) // 2
+            box_draw.text((x, current_y), line, font=font, fill=color)
         if i < num_lines - 1:
             h_curr = line_heights[i]
             h_next = line_heights[i+1]
@@ -1302,11 +1396,11 @@ def generate_textbox_image(text: str, font_type: str, highlight_choice: str = "y
                 if not os.path.exists(watermark_path):
                     watermark_path = "/Users/dhawansevkani/Downloads/charlie banner.png"
             
-            # Subtle black downward gradient below divider line for Charlie (~120px cinematic fade)
-            if font_type.lower() == "charlie":
+            # Subtle black downward gradient below divider line for Charlie and Maga (~120px cinematic fade)
+            if font_type.lower() in ("charlie", "maga"):
                 grad_end_y = min(canvas_h, line_bottom + 120)
-                charlie_grad = draw_vertical_alpha_gradient(canvas_w, canvas_h, line_bottom, grad_end_y, start_alpha=245, end_alpha=0)
-                bg_img = Image.alpha_composite(bg_img, charlie_grad)
+                cinematic_grad = draw_vertical_alpha_gradient(canvas_w, canvas_h, line_bottom, grad_end_y, start_alpha=245, end_alpha=0)
+                bg_img = Image.alpha_composite(bg_img, cinematic_grad)
             
             if watermark_path and os.path.exists(watermark_path):
                 try:
@@ -1315,8 +1409,8 @@ def generate_textbox_image(text: str, font_type: str, highlight_choice: str = "y
                     watermark_h = int(watermark_img.height * (watermark_w / watermark_img.width))
                     watermark_img = watermark_img.resize((watermark_w, watermark_h), Image.Resampling.LANCZOS)
                     
-                    if font_type.lower() == "charlie":
-                        # Boost brightness & opacity of @CHARLIEKIRKHQ watermark for ultra-clear visibility
+                    if font_type.lower() in ("charlie", "maga"):
+                        # Boost brightness & opacity of watermark for ultra-clear visibility
                         wm_arr = np.array(watermark_img)
                         alpha = wm_arr[:, :, 3].astype(np.float32)
                         alpha = np.where(alpha > 20, np.clip(alpha * 1.85, 0, 255), alpha)
@@ -1627,6 +1721,9 @@ STATE_POSITIONING_SHAPE = 6
 STATE_CONFIRM_IG_OCR = 7
 STATE_WAITING_SHAPE2_IMAGE = 8
 STATE_WAITING_DOGE_HIGHLIGHT_LINES = 9
+STATE_WAITING_CHANGE_MAIN = 10
+STATE_WAITING_CHANGE_SHAPE1 = 11
+STATE_WAITING_CHANGE_SHAPE2 = 12
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Entry point: Greet user and offer font styles."""
@@ -1681,7 +1778,46 @@ async def font_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     if font_choice == "freedom":
         context.user_data["chosen_color"] = "orange"
-        save_user_session(update.effective_user.id, "freedom", "orange", context.user_data.get("doge_highlight_lines"))
+        last_text = context.user_data.get("last_text")
+        line_bottom = context.user_data.get("line_bottom")
+        save_user_session(update.effective_user.id, chosen_font="freedom", chosen_color="orange", last_text=last_text, line_bottom=line_bottom)
+        
+        if last_text:
+            status_msg = await query.message.reply_text("🎨 Re-rendering in Freedom style...")
+            try:
+                user_support_image_path = context.user_data.get("user_support_image_path")
+                image_buffer, line_bottom = await asyncio.to_thread(
+                    generate_textbox_image,
+                    last_text, "freedom", "orange",
+                    user_support_image_path=user_support_image_path
+                )
+                png_bytes = image_buffer.getvalue()
+                context.user_data["transparent_png_bytes"] = png_bytes
+                context.user_data["last_rendered_image_bytes"] = png_bytes
+                context.user_data["line_bottom"] = line_bottom
+                save_user_session(update.effective_user.id, chosen_font="freedom", chosen_color="orange", last_text=last_text, line_bottom=line_bottom)
+                
+                keyboard = [[InlineKeyboardButton("🔄 Change Font", callback_data="changefont")]]
+                await send_rendered_media_with_retry(
+                    query.message,
+                    png_bytes,
+                    filename="freedom_textbox.png",
+                    as_document=True,
+                    caption="✅ Switched to **Freedom** style!",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                await safe_delete_message(status_msg)
+                await query.message.reply_text(
+                    "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+                    "📥 **Send an image or a video now** to blend it,\n"
+                    "➡️ Or send new text to create another one."
+                )
+                return STATE_WAITING_BACKGROUND
+            except Exception as e:
+                logger.error(f"Error re-rendering freedom font: {e}")
+                await safe_edit_status_message(status_msg, f"❌ Failed to render Freedom style: {e}")
+                return STATE_WAITING_TEXT
+        
         await query.edit_message_text(
             text=f"Selected Style: **{name}**\n\n"
                  f"🎨 Highlight Color: **Fixed Orange (#F87739)**\n"
@@ -1738,7 +1874,11 @@ async def color_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     color_choice = query.data.split(":")[1]
     context.user_data["chosen_color"] = color_choice
-    save_user_session(update.effective_user.id, context.user_data.get("chosen_font"), color_choice, context.user_data.get("doge_highlight_lines"))
+    last_text = context.user_data.get("last_text")
+    line_bottom = context.user_data.get("line_bottom")
+    font_choice = context.user_data.get("chosen_font", "faith")
+    doge_lines = context.user_data.get("doge_highlight_lines")
+    save_user_session(update.effective_user.id, chosen_font=font_choice, chosen_color=color_choice, doge_highlight_lines=doge_lines, last_text=last_text, line_bottom=line_bottom)
     
     color_names = {
         "yellow": "🟡 Yellow",
@@ -1750,8 +1890,76 @@ async def color_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "purple": "🟪 Purple"
     }
     color_name = color_names.get(color_choice, color_choice.capitalize())
-    font_choice = context.user_data.get("chosen_font", "faith")
     
+    if last_text:
+        status_msg = await query.message.reply_text(f"🎨 Re-rendering in **{font_choice.capitalize()}** ({color_name})...")
+        try:
+            user_support_image_path = context.user_data.get("user_support_image_path")
+            image_buffer, line_bottom = await asyncio.to_thread(
+                generate_textbox_image,
+                last_text, font_choice, color_choice,
+                user_support_image_path=user_support_image_path,
+                doge_highlight_lines=doge_lines
+            )
+            png_bytes = image_buffer.getvalue()
+            context.user_data["transparent_png_bytes"] = png_bytes
+            context.user_data["last_rendered_image_bytes"] = png_bytes
+            context.user_data["line_bottom"] = line_bottom
+            save_user_session(update.effective_user.id, chosen_font=font_choice, chosen_color=color_choice, doge_highlight_lines=doge_lines, last_text=last_text, line_bottom=line_bottom)
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
+                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
+                ],
+                [
+                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
+                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
+                ],
+                [
+                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
+                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
+                ],
+                [
+                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
+                ],
+                [
+                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            caption_text = f"✅ **{font_choice.capitalize()}** transparent text box generated!"
+            as_doc = font_choice in ("maga", "charlie", "faith", "freedom", "doge")
+            await send_rendered_media_with_retry(
+                query.message,
+                png_bytes,
+                filename=f"{font_choice}_textbox.png",
+                as_document=as_doc,
+                caption=caption_text,
+                reply_markup=reply_markup
+            )
+            await safe_delete_message(status_msg)
+            
+            if font_choice in ("charlie", "maga", "maga_charlie"):
+                bg_keyboard = [[InlineKeyboardButton("✅ Done", callback_data="bg_done")]]
+                await query.message.reply_text(
+                    "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+                    "📥 **Send an image or a video now** to blend it,\n"
+                    "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
+                    reply_markup=InlineKeyboardMarkup(bg_keyboard)
+                )
+            else:
+                await query.message.reply_text(
+                    "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+                    "📥 **Send an image or a video now** to blend it,\n"
+                    "➡️ Or send new text to create another one."
+                )
+            return STATE_WAITING_BACKGROUND
+        except Exception as e:
+            logger.error(f"Error re-rendering in color_selected: {e}")
+            await safe_edit_status_message(status_msg, f"❌ Error re-rendering: {str(e)}")
+            return STATE_WAITING_TEXT
+
     await query.edit_message_text(
         text=f"🎨 Font: **{font_choice.capitalize()}** | Color: **{color_name}**\n\n"
              "💬 Send me the text you want in your box.\n"
@@ -1787,10 +1995,12 @@ async def change_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         status_msg = await query.message.reply_text("🎨 Re-rendering with new color...")
         try:
             user_support_image_path = context.user_data.get("user_support_image_path")
-            image_buffer, line_bottom = generate_textbox_image(
+            doge_lines = context.user_data.get("doge_highlight_lines")
+            image_buffer, line_bottom = await asyncio.to_thread(
+                generate_textbox_image,
                 last_text, font_choice, color_choice,
                 user_support_image_path=user_support_image_path,
-                doge_highlight_lines=context.user_data.get("doge_highlight_lines")
+                doge_highlight_lines=doge_lines
             )
             
             # Save transparent PNG bytes in session
@@ -1798,6 +2008,7 @@ async def change_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             context.user_data["transparent_png_bytes"] = png_bytes
             context.user_data["last_rendered_image_bytes"] = png_bytes
             context.user_data["line_bottom"] = line_bottom
+            save_user_session(update.effective_user.id, chosen_font=font_choice, chosen_color=color_choice, doge_highlight_lines=doge_lines, last_text=last_text, line_bottom=line_bottom)
             
             # Build post-render keyboard with color change + font change options
             if font_choice in ("maga", "charlie", "maga_charlie", "faith", "doge"):
@@ -1856,7 +2067,7 @@ async def change_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             await safe_delete_message(status_msg)
             
             # Re-prompt for background image/video
-            if font_choice in ("charlie", "maga_charlie"):
+            if font_choice in ("charlie", "maga", "maga_charlie"):
                 bg_keyboard = [
                     [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
                 ]
@@ -1919,9 +2130,14 @@ async def change_font(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return STATE_CHOOSING_FONT
 
 async def image_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Inform user that custom images feature is disabled."""
+    """If text box already generated, treat incoming photo as background. Otherwise prompt for text."""
+    restore_session_if_needed(update, context)
+    png_bytes = context.user_data.get("transparent_png_bytes")
+    last_text = context.user_data.get("last_text")
+    if png_bytes or last_text:
+        return await background_received(update, context)
     await update.message.reply_text(
-        "⚠️ Custom supporting images are disabled. Please send text only to generate your text box."
+        "💬 Please send text first to generate your text box. Once created, you can send photos or videos to overlay behind it!"
     )
     return STATE_WAITING_TEXT
 
@@ -1971,18 +2187,18 @@ async def text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
             }
-            img_response = requests.get(media_url, headers=headers, allow_redirects=True, timeout=15)
+            img_response = await asyncio.to_thread(requests.get, media_url, headers=headers, allow_redirects=True, timeout=15)
             if img_response.status_code != 200 or "image" not in img_response.headers.get("Content-Type", ""):
                 raise ValueError(f"Failed to download image (HTTP {img_response.status_code})")
                 
             # 3. Call OCR.space with the downloaded image bytes
             await status_msg.edit_text("🤖 Image downloaded! Extracting text via OCR...")
-            extracted_text = call_ocr_space(img_response.content)
+            extracted_text = await asyncio.to_thread(call_ocr_space, img_response.content)
             
             # If OCR failed, try fallback to caption
             if not extracted_text:
                 try:
-                    caption, _, _ = fetch_instagram_post(text, user_id)
+                    caption, _, _ = await asyncio.to_thread(fetch_instagram_post, text, user_id)
                     extracted_text = caption
                 except Exception:
                     pass
@@ -1994,7 +2210,7 @@ async def text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             context.user_data["ocr_extracted_text"] = extracted_text
             
             # AI Proofreading check on extracted OCR text
-            corrected_text = proofread_text_with_ai(extracted_text)
+            corrected_text = await asyncio.to_thread(proofread_text_with_ai, extracted_text)
             has_corrections = (corrected_text.upper().strip() != extracted_text.upper().strip())
             context.user_data["suggested_corrected_text"] = corrected_text
             
@@ -2062,7 +2278,7 @@ async def text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     status_msg = await update.message.reply_text("🎨 Checking grammar & rendering, please wait...")
     
     # AI Proofreading check
-    corrected_text = proofread_text_with_ai(text)
+    corrected_text = await asyncio.to_thread(proofread_text_with_ai, text)
     has_corrections = (corrected_text.upper().strip() != text.upper().strip())
     
     # Store the last text so color change can re-render
@@ -2070,13 +2286,18 @@ async def text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     try:
         user_support_image_path = context.user_data.get("user_support_image_path")
-        image_buffer, line_bottom = generate_textbox_image(text, font_choice, color_choice, user_support_image_path=user_support_image_path)
+        image_buffer, line_bottom = await asyncio.to_thread(
+            generate_textbox_image,
+            text, font_choice, color_choice,
+            user_support_image_path=user_support_image_path
+        )
         
         # Save transparent PNG bytes in session
         png_bytes = image_buffer.getvalue()
         context.user_data["transparent_png_bytes"] = png_bytes
         context.user_data["last_rendered_image_bytes"] = png_bytes
         context.user_data["line_bottom"] = line_bottom
+        save_user_session(user_id, chosen_font=font_choice, chosen_color=color_choice, last_text=text, line_bottom=line_bottom)
         
         color_names = {
             "yellow": "🟡 Yellow",
@@ -2168,7 +2389,7 @@ async def text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 reply_markup=markup,
                 parse_mode="Markdown"
             )
-        if font_choice in ("charlie", "maga_charlie"):
+        if font_choice in ("charlie", "maga", "maga_charlie"):
             bg_keyboard = [
                 [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
             ]
@@ -2209,7 +2430,7 @@ async def doge_highlight_lines_received(update: Update, context: ContextTypes.DE
         return STATE_WAITING_DOGE_HIGHLIGHT_LINES
 
     context.user_data["doge_highlight_lines"] = num_lines
-    save_user_session(update.effective_user.id, "doge", context.user_data.get("chosen_color"), num_lines)
+    save_user_session(update.effective_user.id, chosen_font="doge", chosen_color=context.user_data.get("chosen_color"), doge_highlight_lines=num_lines)
     text = context.user_data.get("doge_pending_text", "")
     
     # Clear the pending text
@@ -2218,7 +2439,7 @@ async def doge_highlight_lines_received(update: Update, context: ContextTypes.DE
     status_msg = await update.message.reply_text("🎨 Checking grammar & rendering, please wait...")
     
     # AI Proofreading check
-    corrected_text = proofread_text_with_ai(text)
+    corrected_text = await asyncio.to_thread(proofread_text_with_ai, text)
     has_corrections = (corrected_text.upper().strip() != text.upper().strip())
     
     # Store the last text so color change can re-render
@@ -2228,7 +2449,8 @@ async def doge_highlight_lines_received(update: Update, context: ContextTypes.DE
     
     try:
         user_support_image_path = context.user_data.get("user_support_image_path")
-        image_buffer, line_bottom = generate_textbox_image(
+        image_buffer, line_bottom = await asyncio.to_thread(
+            generate_textbox_image,
             text, font_choice, color_choice,
             user_support_image_path=user_support_image_path,
             doge_highlight_lines=num_lines
@@ -2237,7 +2459,9 @@ async def doge_highlight_lines_received(update: Update, context: ContextTypes.DE
         # Save transparent PNG bytes in session
         png_bytes = image_buffer.getvalue()
         context.user_data["transparent_png_bytes"] = png_bytes
+        context.user_data["last_rendered_image_bytes"] = png_bytes
         context.user_data["line_bottom"] = line_bottom
+        save_user_session(update.effective_user.id, chosen_font="doge", chosen_color=color_choice, doge_highlight_lines=num_lines, last_text=text, line_bottom=line_bottom)
         
         color_names = {
             "yellow": "🟡 Yellow",
@@ -2355,12 +2579,14 @@ async def ig_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         status_msg = await query.message.reply_text("🎨 Rendering your text box, please wait...")
         try:
             user_support_image_path = context.user_data.get("user_support_image_path")
-            image_buffer, line_bottom = generate_textbox_image(
+            image_buffer, line_bottom = await asyncio.to_thread(
+                generate_textbox_image,
                 chosen_text, "freedom", color_choice, user_support_image_path=user_support_image_path
             )
             png_bytes = image_buffer.getvalue()
             context.user_data["transparent_png_bytes"] = png_bytes
             context.user_data["line_bottom"] = line_bottom
+            save_user_session(update.effective_user.id, chosen_font="freedom", chosen_color=color_choice, last_text=chosen_text, line_bottom=line_bottom)
             keyboard = [[InlineKeyboardButton("🔄 Change Font", callback_data="changefont")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             caption_text = "✅ **Freedom** transparent text box generated!"
@@ -2399,7 +2625,8 @@ async def ig_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         status_msg = await query.message.reply_text("🎨 Rendering your text box, please wait...")
         try:
             user_support_image_path = context.user_data.get("user_support_image_path")
-            image_buffer, line_bottom = generate_textbox_image(
+            image_buffer, line_bottom = await asyncio.to_thread(
+                generate_textbox_image,
                 chosen_text, "charlie", color_choice, user_support_image_path=user_support_image_path
             )
             
@@ -2409,6 +2636,7 @@ async def ig_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["last_rendered_image_bytes"] = png_bytes
             context.user_data["last_text"] = chosen_text
             context.user_data["line_bottom"] = line_bottom
+            save_user_session(update.effective_user.id, chosen_font="charlie", chosen_color=color_choice, last_text=chosen_text, line_bottom=line_bottom)
             
             keyboard = [
                 [
@@ -2510,7 +2738,7 @@ async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = update.message.text.strip()
     
     # Run AI proofreading on edited text too!
-    corrected_text = proofread_text_with_ai(text)
+    corrected_text = await asyncio.to_thread(proofread_text_with_ai, text)
     has_corrections = (corrected_text.upper().strip() != text.upper().strip())
     
     context.user_data["ocr_extracted_text"] = text
@@ -2545,12 +2773,14 @@ async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE)
         status_msg = await update.message.reply_text("🎨 Rendering your text box, please wait...")
         try:
             user_support_image_path = context.user_data.get("user_support_image_path")
-            image_buffer, line_bottom = generate_textbox_image(
+            image_buffer, line_bottom = await asyncio.to_thread(
+                generate_textbox_image,
                 text, "freedom", color_choice, user_support_image_path=user_support_image_path
             )
             png_bytes = image_buffer.getvalue()
             context.user_data["transparent_png_bytes"] = png_bytes
             context.user_data["line_bottom"] = line_bottom
+            save_user_session(update.effective_user.id, chosen_font="freedom", chosen_color=color_choice, last_text=text, line_bottom=line_bottom)
             keyboard = [[InlineKeyboardButton("🔄 Change Font", callback_data="changefont")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             caption_text = "✅ **Freedom** transparent text box generated!"
@@ -2589,7 +2819,8 @@ async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE)
         status_msg = await update.message.reply_text("🎨 Rendering your text box, please wait...")
         try:
             user_support_image_path = context.user_data.get("user_support_image_path")
-            image_buffer, line_bottom = generate_textbox_image(
+            image_buffer, line_bottom = await asyncio.to_thread(
+                generate_textbox_image,
                 text, "charlie", color_choice, user_support_image_path=user_support_image_path
             )
             
@@ -2599,6 +2830,7 @@ async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data["last_rendered_image_bytes"] = png_bytes
             context.user_data["last_text"] = text
             context.user_data["line_bottom"] = line_bottom
+            save_user_session(update.effective_user.id, chosen_font="charlie", chosen_color=color_choice, last_text=text, line_bottom=line_bottom)
             
             keyboard = [
                 [
@@ -2715,16 +2947,20 @@ async def color_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     status_msg = await query.message.reply_text("🎨 Rendering your text box, please wait...")
     try:
         user_support_image_path = context.user_data.get("user_support_image_path")
-        image_buffer, line_bottom = generate_textbox_image(
+        doge_lines = context.user_data.get("doge_highlight_lines")
+        image_buffer, line_bottom = await asyncio.to_thread(
+            generate_textbox_image,
             text, font_choice, color_choice,
             user_support_image_path=user_support_image_path,
-            doge_highlight_lines=context.user_data.get("doge_highlight_lines")
+            doge_highlight_lines=doge_lines
         )
         
         # Save transparent PNG bytes in session
         png_bytes = image_buffer.getvalue()
         context.user_data["transparent_png_bytes"] = png_bytes
+        context.user_data["last_rendered_image_bytes"] = png_bytes
         context.user_data["line_bottom"] = line_bottom
+        save_user_session(user_id, chosen_font=font_choice, chosen_color=color_choice, doge_highlight_lines=doge_lines, last_text=text, line_bottom=line_bottom)
         
         color_names = {
             "yellow": "🟡 Yellow",
@@ -2791,11 +3027,22 @@ async def color_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await safe_delete_message(status_msg)
         
         # Ask user for background image/video
-        await query.message.reply_text(
-            "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-            "📥 **Send an image or a video now** to blend it,\n"
-            "➡️ Or click/type /skip to keep the transparent PNG layout and send new text."
-        )
+        if font_choice in ("charlie", "maga", "maga_charlie"):
+            bg_keyboard = [
+                [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
+            ]
+            await query.message.reply_text(
+                "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+                "📥 **Send an image or a video now** to blend it,\n"
+                "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
+                reply_markup=InlineKeyboardMarkup(bg_keyboard)
+            )
+        else:
+            await query.message.reply_text(
+                "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+                "📥 **Send an image or a video now** to blend it,\n"
+                "➡️ Or click/type /skip to keep the transparent PNG layout and send new text."
+            )
         return STATE_WAITING_BACKGROUND
         
     except Exception as e:
@@ -2835,10 +3082,13 @@ async def proofread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     status_msg = await query.message.reply_text("🎨 Re-rendering with corrected text...")
     try:
-        image_buffer, line_bottom = generate_textbox_image(
+        user_support_image_path = context.user_data.get("user_support_image_path")
+        doge_lines = context.user_data.get("doge_highlight_lines")
+        image_buffer, line_bottom = await asyncio.to_thread(
+            generate_textbox_image,
             corrected_text, font_choice, color_choice,
             user_support_image_path=user_support_image_path,
-            doge_highlight_lines=context.user_data.get("doge_highlight_lines")
+            doge_highlight_lines=doge_lines
         )
         
         # Save transparent PNG bytes in session
@@ -2847,6 +3097,7 @@ async def proofread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["last_rendered_image_bytes"] = png_bytes
         context.user_data["last_text"] = corrected_text
         context.user_data["line_bottom"] = line_bottom
+        save_user_session(update.effective_user.id, chosen_font=font_choice, chosen_color=color_choice, doge_highlight_lines=doge_lines, last_text=corrected_text, line_bottom=line_bottom)
         
         # Build standard post-render keyboard
         color_names = {
@@ -2919,6 +3170,12 @@ async def proofread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
         await safe_delete_message(status_msg)
         await query.message.edit_text("✅ Switched to corrected text box successfully!")
+        await query.message.reply_text(
+            "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+            "📥 **Send an image or a video now** to blend it,\n"
+            "➡️ Or send new text to create another one."
+        )
+        return STATE_WAITING_BACKGROUND
         
     except Exception as e:
         logger.error(f"Failed to generate/send image after proofread: {e}")
@@ -2928,8 +3185,7 @@ async def proofread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else f"❌ Error during rendering: {str(e)}"
         )
         await safe_edit_status_message(status_msg, err_msg)
-        
-    return STATE_WAITING_TEXT
+        return STATE_WAITING_BACKGROUND
 
 async def background_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Download the background image or video and overlay the transparent PNG."""
@@ -2940,8 +3196,22 @@ async def background_received(update: Update, context: ContextTypes.DEFAULT_TYPE
     color_choice = context.user_data.get("chosen_color", "yellow")
     
     if not png_bytes:
-        await update.message.reply_text("❌ No text box generated yet. Please send some text first.")
-        return STATE_WAITING_TEXT
+        last_text = context.user_data.get("last_text")
+        if last_text:
+            user_support_image_path = context.user_data.get("user_support_image_path")
+            doge_lines = context.user_data.get("doge_highlight_lines")
+            image_buffer, line_bottom = await asyncio.to_thread(
+                generate_textbox_image,
+                last_text, font_choice, color_choice,
+                user_support_image_path=user_support_image_path,
+                doge_highlight_lines=doge_lines
+            )
+            png_bytes = image_buffer.getvalue()
+            context.user_data["transparent_png_bytes"] = png_bytes
+            context.user_data["line_bottom"] = line_bottom
+        else:
+            await update.message.reply_text("❌ No text box generated yet. Please send some text first.")
+            return STATE_WAITING_TEXT
         
     status_msg = await update.message.reply_text("📥 Processing media and rendering 3D effect...")
     
@@ -2960,8 +3230,9 @@ async def background_received(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data["temp_bg_path"] = bg_path
             context.user_data["temp_bg_type"] = "image"
             
-            # Generate standard preview
-            preview_buffer = overlay_png_on_image(
+            # Generate standard preview in thread
+            preview_buffer = await asyncio.to_thread(
+                overlay_png_on_image,
                 bg_path, png_bytes, 
                 shape_image_path=None, 
                 shape_type=shape_type, 
@@ -2977,6 +3248,9 @@ async def background_received(update: Update, context: ContextTypes.DEFAULT_TYPE
             await status_msg.delete()
             
             keyboard = [
+                [
+                    InlineKeyboardButton("🔄 Change Main Image", callback_data="change:main")
+                ],
                 [
                     InlineKeyboardButton("✅ Done", callback_data="bg_done")
                 ]
@@ -3007,7 +3281,12 @@ async def background_received(update: Update, context: ContextTypes.DEFAULT_TYPE
             out_path = os.path.join(BASE_DIR, f"user_output_{user_id}.mp4")
             await file_obj.download_to_drive(bg_path)
             
-            overlay_png_on_video(bg_path, png_bytes, out_path, shape_type=shape_type, border_color=highlight_color, line_bottom=context.user_data.get("line_bottom"))
+            await asyncio.to_thread(
+                overlay_png_on_video,
+                bg_path, png_bytes, out_path,
+                shape_type=shape_type, border_color=highlight_color,
+                line_bottom=context.user_data.get("line_bottom")
+            )
             
             if os.path.exists(bg_path):
                 os.remove(bg_path)
@@ -3050,10 +3329,11 @@ async def skip_background(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await target_msg.reply_text("✅ Transparent PNG layout kept. Send new text to generate another!")
     
-    if font_choice in ("charlie", "maga_charlie"):
+    if font_choice in ("charlie", "maga", "maga_charlie"):
         caption_status = await target_msg.reply_text("✍️ Generating Instagram caption...")
         caption_text = await asyncio.to_thread(
-            generate_charlie_caption,
+            generate_post_caption,
+            font_choice,
             context.user_data.get("transparent_png_bytes"),
             context.user_data.get("last_text", "")
         )
@@ -3103,6 +3383,24 @@ def shape_position_keyboard(move_step: int = 25, scale_step: float = 0.1, active
         keyboard.append([
             InlineKeyboardButton("🔄 Switch to Shape 1", callback_data="pos:switch_shape_1")
         ])
+    
+    keyboard.append([
+        InlineKeyboardButton("🖼️ Change Main Image", callback_data="pos:change_main")
+    ])
+    
+    if has_second_shape:
+        keyboard.append([
+            InlineKeyboardButton("🔄 Change Shape 1", callback_data="pos:change_shape1"),
+            InlineKeyboardButton("🔄 Change Shape 2", callback_data="pos:change_shape2")
+        ])
+        keyboard.append([
+            InlineKeyboardButton("🗑️ Remove Shape 2", callback_data="pos:remove_shape2")
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton("🔄 Change Shape 1", callback_data="pos:change_shape1")
+        ])
+        
     keyboard.append([
         InlineKeyboardButton("✅ Done", callback_data="pos:done")
     ])
@@ -3135,7 +3433,8 @@ async def update_positioning_ui(query, context: ContextTypes.DEFAULT_TYPE):
         
     shape_type = "square" if font_choice == "maga" else "circle"
     
-    combined_buffer = overlay_png_on_image(
+    combined_buffer = await asyncio.to_thread(
+        overlay_png_on_image,
         bg_image_path=bg_path,
         png_bytes=png_bytes,
         shape_image_path=shape_path,
@@ -3205,7 +3504,8 @@ async def shape_image_received(update: Update, context: ContextTypes.DEFAULT_TYP
             
         shape_type = "square" if font_choice == "maga" else "circle"
         
-        combined_buffer = overlay_png_on_image(
+        combined_buffer = await asyncio.to_thread(
+            overlay_png_on_image,
             bg_path, png_bytes, 
             shape_image_path=shape_path, 
             shape_type=shape_type, 
@@ -3272,7 +3572,8 @@ async def shape2_image_received(update: Update, context: ContextTypes.DEFAULT_TY
             highlight_color = get_highlight_color(color_choice)
         shape_type = "square" if font_choice == "maga" else "circle"
         
-        combined_buffer = overlay_png_on_image(
+        combined_buffer = await asyncio.to_thread(
+            overlay_png_on_image,
             bg_image_path=bg_path,
             png_bytes=png_bytes,
             shape_image_path=shape_path,
@@ -3353,10 +3654,11 @@ async def skip_shape_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             reply_markup=None
         )
         
-        if font_choice in ("charlie", "maga_charlie"):
+        if font_choice in ("charlie", "maga", "maga_charlie"):
             caption_status = await query.message.reply_text("✍️ Generating Instagram caption...")
             caption_text = await asyncio.to_thread(
-                generate_charlie_caption,
+                generate_post_caption,
+                font_choice,
                 img_bytes,
                 context.user_data.get("last_text", "")
             )
@@ -3369,16 +3671,15 @@ async def skip_shape_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     status_msg = await update.message.reply_text("📥 Rendering standard image overlay...")
     
     try:
-        combined_buffer = overlay_png_on_image(
+        combined_buffer = await asyncio.to_thread(
+            overlay_png_on_image,
             bg_path, png_bytes, 
-            shape_image_path=None, 
-            shape_type=shape_type, 
-            border_color=highlight_color,
-            shape_offset_x=0,
-            shape_offset_y=0,
-            shape_scale=1.0,
-            simple_overlay=True,
-            line_bottom=context.user_data.get("line_bottom")
+            None,   # shape_image_path
+            shape_type, 
+            highlight_color,
+            0, 0, 1.0,
+            True,   # simple_overlay
+            context.user_data.get("line_bottom")
         )
         context.user_data["last_rendered_image_bytes"] = combined_buffer.getvalue()
         
@@ -3400,10 +3701,11 @@ async def skip_shape_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             caption="✅ Done! Standard image overlay generated. Send new text to generate another one!"
         )
         
-        if font_choice in ("charlie", "maga_charlie"):
+        if font_choice in ("charlie", "maga", "maga_charlie"):
             caption_status = await update.message.reply_text("✍️ Generating Instagram caption...")
             caption_text = await asyncio.to_thread(
-                generate_charlie_caption,
+                generate_post_caption,
+                font_choice,
                 combined_buffer.getvalue(),
                 context.user_data.get("last_text", "")
             )
@@ -3472,9 +3774,42 @@ async def shape_position_callback(update: Update, context: ContextTypes.DEFAULT_
     elif action == "add_second_shape":
         await query.message.reply_text(
             "📥 **Please send/upload the second shape image now.**\n\n"
-            "The bot will automatically place it on the opposite side of your first shape."
+            "The bot will automatically place it on the opposite side of your first shape.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_change")]])
         )
         return STATE_WAITING_SHAPE2_IMAGE
+    elif action == "change_main":
+        await query.message.reply_text(
+            "🖼️ **Please send a new main background image now.**\n\n"
+            "Your existing text box and shapes will be preserved on the new background.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_change")]])
+        )
+        return STATE_WAITING_CHANGE_MAIN
+    elif action == "change_shape1":
+        await query.message.reply_text(
+            "👤 **Please send a new image for Shape 1 now.**\n\n"
+            "Your current position and scale settings will be kept.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_change")]])
+        )
+        return STATE_WAITING_CHANGE_SHAPE1
+    elif action == "change_shape2":
+        await query.message.reply_text(
+            "👥 **Please send a new image for Shape 2 now.**\n\n"
+            "Your current position and scale settings will be kept.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_change")]])
+        )
+        return STATE_WAITING_CHANGE_SHAPE2
+    elif action == "remove_shape2":
+        shape2_path = context.user_data.pop("temp_shape2_img_path", None)
+        clear_media_caches(shape2_path=shape2_path)
+        context.user_data["active_shape_editing"] = 1
+        if shape2_path and os.path.exists(shape2_path):
+            try:
+                os.remove(shape2_path)
+            except Exception:
+                pass
+        await update_positioning_ui(query, context)
+        return STATE_POSITIONING_SHAPE
     elif action == "switch_shape_1":
         context.user_data["active_shape_editing"] = 1
     elif action == "switch_shape_2":
@@ -3506,10 +3841,11 @@ async def shape_position_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.message.edit_reply_markup(reply_markup=None)
         await query.message.reply_text("✅ Done! Final pop-out layout completed. Send new text to generate another one!")
         
-        if font_choice in ("charlie", "maga_charlie"):
+        if font_choice in ("charlie", "maga", "maga_charlie"):
             caption_status = await query.message.reply_text("✍️ Generating Instagram caption...")
             caption_text = await asyncio.to_thread(
-                generate_charlie_caption,
+                generate_post_caption,
+                font_choice,
                 img_bytes,
                 context.user_data.get("last_text", "")
             )
@@ -3569,22 +3905,24 @@ async def instagram_background_callback(update: Update, context: ContextTypes.DE
             context.user_data["temp_bg_type"] = "image"
             
             # Generate standard preview
-            preview_buffer = overlay_png_on_image(
+            preview_buffer = await asyncio.to_thread(
+                overlay_png_on_image,
                 media_path, png_bytes, 
-                shape_image_path=None, 
-                shape_type=shape_type, 
-                border_color=highlight_color,
-                shape_offset_x=0,
-                shape_offset_y=0,
-                shape_scale=1.0,
-                simple_overlay=True,
-                line_bottom=context.user_data.get("line_bottom")
+                None,   # shape_image_path
+                shape_type, 
+                highlight_color,
+                0, 0, 1.0,
+                True,   # simple_overlay
+                context.user_data.get("line_bottom")
             )
             context.user_data["last_rendered_image_bytes"] = preview_buffer.getvalue()
             
             await safe_delete_message(status_msg)
             
             keyboard = [
+                [
+                    InlineKeyboardButton("🔄 Change Main Image", callback_data="change:main")
+                ],
                 [
                     InlineKeyboardButton("✅ Done", callback_data="bg_done")
                 ]
@@ -3604,7 +3942,7 @@ async def instagram_background_callback(update: Update, context: ContextTypes.DE
         else:
             # Video overlay (directly process and return to text waiting state)
             out_path = os.path.join(BASE_DIR, f"user_output_{user_id}.mp4")
-            overlay_png_on_video(media_path, png_bytes, out_path, shape_type=shape_type, border_color=highlight_color, line_bottom=context.user_data.get("line_bottom"))
+            await asyncio.to_thread(overlay_png_on_video, media_path, png_bytes, out_path, shape_type=shape_type, border_color=highlight_color, line_bottom=context.user_data.get("line_bottom"))
             
             if os.path.exists(media_path):
                 os.remove(media_path)
@@ -3630,18 +3968,358 @@ async def instagram_background_callback(update: Update, context: ContextTypes.DE
         )
         await safe_edit_status_message(status_msg, err_msg)
         
-    return STATE_WAITING_TEXT
+async def start_change_main_from_standard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Trigger changing main background image from standard overlay preview."""
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "🖼️ **Please send a new main background image now.**",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="cancel_change")]])
+    )
+    return STATE_WAITING_CHANGE_MAIN
+
+async def cancel_change_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancels image replacement and returns to previous state."""
+    query = update.callback_query
+    await query.answer("Cancelled")
+    shape_path = context.user_data.get("temp_shape_img_path")
+    if shape_path and os.path.exists(shape_path):
+        await update_positioning_ui(query, context)
+        return STATE_POSITIONING_SHAPE
+    else:
+        await query.message.reply_text("Keeping current main image. Send shape image to continue, or click Done.")
+        return STATE_WAITING_SHAPE_IMAGE
+
+async def change_main_image_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Replace main background image and refresh composite or preview."""
+    user_id = update.effective_user.id
+    status_msg = await update.message.reply_text("📥 Updating main background image...")
+    try:
+        file_obj = await update.message.photo[-1].get_file()
+        bg_path = os.path.join(BASE_DIR, f"user_bg_img_{user_id}.jpg")
+        old_bg = context.user_data.get("temp_bg_path")
+        clear_media_caches(bg_path=old_bg)
+        await file_obj.download_to_drive(bg_path)
+        context.user_data["temp_bg_path"] = bg_path
+        context.user_data["temp_bg_type"] = "image"
+        
+        png_bytes = context.user_data.get("transparent_png_bytes")
+        font_choice = context.user_data.get("chosen_font", "faith")
+        color_choice = context.user_data.get("chosen_color", "yellow")
+        if font_choice == "freedom":
+            highlight_color = FREEDOM_WATERMARK_LINE_COLOR
+        else:
+            highlight_color = get_highlight_color(color_choice)
+        shape_type = "square" if font_choice == "maga" else "circle"
+        
+        # Warmup cutout cache for the new background image
+        asyncio.create_task(asyncio.to_thread(warmup_cutout_cache, bg_path, png_bytes, context.user_data.get("line_bottom")))
+        
+        await safe_delete_message(status_msg)
+        
+        # Check if Shape 1 exists (already in positioning mode)
+        shape_path = context.user_data.get("temp_shape_img_path")
+        if shape_path and os.path.exists(shape_path):
+            shape2_path = context.user_data.get("temp_shape2_img_path")
+            offset_x = context.user_data.get("shape_offset_x", -275)
+            offset_y = context.user_data.get("shape_offset_y", 0)
+            scale = context.user_data.get("shape_scale", 1.0)
+            offset_x2 = context.user_data.get("shape2_offset_x", 275)
+            offset_y2 = context.user_data.get("shape2_offset_y", 0)
+            scale2 = context.user_data.get("shape2_scale", 1.0)
+            
+            combined_buffer = await asyncio.to_thread(
+                overlay_png_on_image,
+                bg_image_path=bg_path,
+                png_bytes=png_bytes,
+                shape_image_path=shape_path,
+                shape_type=shape_type,
+                border_color=highlight_color,
+                shape_offset_x=offset_x,
+                shape_offset_y=offset_y,
+                shape_scale=scale,
+                shape2_image_path=shape2_path,
+                shape2_offset_x=offset_x2,
+                shape2_offset_y=offset_y2,
+                shape2_scale=scale2,
+                line_bottom=context.user_data.get("line_bottom"),
+                preview_mode=True
+            )
+            context.user_data["last_rendered_image_bytes"] = combined_buffer.getvalue()
+            
+            move_step = context.user_data.get("shape_move_step", 25)
+            scale_step = context.user_data.get("shape_scale_step", 0.1)
+            active_shape = context.user_data.get("active_shape_editing", 1)
+            has_second_shape = bool(shape2_path and os.path.exists(shape2_path))
+            
+            curr_offset_x = offset_x2 if active_shape == 2 else offset_x
+            curr_offset_y = offset_y2 if active_shape == 2 else offset_y
+            curr_scale = scale2 if active_shape == 2 else scale
+            
+            await update.message.reply_photo(
+                photo=combined_buffer,
+                caption=(
+                    f"✅ **Main background image updated!**\n\n"
+                    f"🎮 **Use the controls below to position Shape {active_shape}:**\n\n"
+                    f"📍 Offset: ({curr_offset_x}px, {curr_offset_y}px) [Step: {move_step}px]\n"
+                    f"🔎 Scale: {curr_scale:.2f}x [Step: {scale_step:.2f}x]\n\n"
+                    "When satisfied, click **Done**!"
+                ),
+                reply_markup=shape_position_keyboard(move_step=move_step, scale_step=scale_step, active_shape=active_shape, has_second_shape=has_second_shape)
+            )
+            return STATE_POSITIONING_SHAPE
+        else:
+            # At standard overlay stage
+            preview_buffer = await asyncio.to_thread(
+                overlay_png_on_image,
+                bg_path, png_bytes,
+                shape_image_path=None,
+                shape_type=shape_type,
+                border_color=highlight_color,
+                shape_offset_x=0,
+                shape_offset_y=0,
+                shape_scale=1.0,
+                simple_overlay=True,
+                line_bottom=context.user_data.get("line_bottom")
+            )
+            context.user_data["last_rendered_image_bytes"] = preview_buffer.getvalue()
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("🔄 Change Main Image", callback_data="change:main")
+                ],
+                [
+                    InlineKeyboardButton("✅ Done", callback_data="bg_done")
+                ]
+            ]
+            await update.message.reply_photo(
+                photo=preview_buffer,
+                caption=(
+                    "🖼️ **Main background image updated!**\n\n"
+                    f"👤 Send the **shape image** (different from the background) to place inside the **{shape_type}** shape behind the subject for a 3D pop-out layout.\n"
+                    "➡️ Or click **Done** below to save this standard overlay."
+                ),
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return STATE_WAITING_SHAPE_IMAGE
+    except Exception as e:
+        logger.error(f"Error changing main image: {e}")
+        await safe_edit_status_message(status_msg, f"❌ Failed to update main image: {str(e)}")
+        shape_path = context.user_data.get("temp_shape_img_path")
+        return STATE_POSITIONING_SHAPE if (shape_path and os.path.exists(shape_path)) else STATE_WAITING_SHAPE_IMAGE
+
+async def change_shape1_image_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Replace Shape 1 image and re-render."""
+    user_id = update.effective_user.id
+    status_msg = await update.message.reply_text("📥 Updating Shape 1 image...")
+    try:
+        file_obj = await update.message.photo[-1].get_file()
+        shape_path = os.path.join(BASE_DIR, f"user_shape_img_{user_id}.jpg")
+        old_shape = context.user_data.get("temp_shape_img_path")
+        clear_media_caches(shape_path=old_shape)
+        await file_obj.download_to_drive(shape_path)
+        context.user_data["temp_shape_img_path"] = shape_path
+        
+        png_bytes = context.user_data.get("transparent_png_bytes")
+        bg_path = context.user_data.get("temp_bg_path")
+        shape2_path = context.user_data.get("temp_shape2_img_path")
+        font_choice = context.user_data.get("chosen_font", "faith")
+        color_choice = context.user_data.get("chosen_color", "yellow")
+        if font_choice == "freedom":
+            highlight_color = FREEDOM_WATERMARK_LINE_COLOR
+        else:
+            highlight_color = get_highlight_color(color_choice)
+        shape_type = "square" if font_choice == "maga" else "circle"
+        
+        offset_x = context.user_data.get("shape_offset_x", -275)
+        offset_y = context.user_data.get("shape_offset_y", 0)
+        scale = context.user_data.get("shape_scale", 1.0)
+        offset_x2 = context.user_data.get("shape2_offset_x", 275)
+        offset_y2 = context.user_data.get("shape2_offset_y", 0)
+        scale2 = context.user_data.get("shape2_scale", 1.0)
+        
+        combined_buffer = await asyncio.to_thread(
+            overlay_png_on_image,
+            bg_image_path=bg_path,
+            png_bytes=png_bytes,
+            shape_image_path=shape_path,
+            shape_type=shape_type,
+            border_color=highlight_color,
+            shape_offset_x=offset_x,
+            shape_offset_y=offset_y,
+            shape_scale=scale,
+            shape2_image_path=shape2_path,
+            shape2_offset_x=offset_x2,
+            shape2_offset_y=offset_y2,
+            shape2_scale=scale2,
+            line_bottom=context.user_data.get("line_bottom"),
+            preview_mode=True
+        )
+        context.user_data["last_rendered_image_bytes"] = combined_buffer.getvalue()
+        
+        move_step = context.user_data.get("shape_move_step", 25)
+        scale_step = context.user_data.get("shape_scale_step", 0.1)
+        active_shape = context.user_data.get("active_shape_editing", 1)
+        has_second_shape = bool(shape2_path and os.path.exists(shape2_path))
+        
+        curr_offset_x = offset_x2 if active_shape == 2 else offset_x
+        curr_offset_y = offset_y2 if active_shape == 2 else offset_y
+        curr_scale = scale2 if active_shape == 2 else scale
+        
+        await safe_delete_message(status_msg)
+        await update.message.reply_photo(
+            photo=combined_buffer,
+            caption=(
+                f"✅ **Shape 1 image updated!**\n\n"
+                f"🎮 **Use the controls below to position Shape {active_shape}:**\n\n"
+                f"📍 Offset: ({curr_offset_x}px, {curr_offset_y}px) [Step: {move_step}px]\n"
+                f"🔎 Scale: {curr_scale:.2f}x [Step: {scale_step:.2f}x]\n\n"
+                "When satisfied, click **Done**!"
+            ),
+            reply_markup=shape_position_keyboard(move_step=move_step, scale_step=scale_step, active_shape=active_shape, has_second_shape=has_second_shape)
+        )
+        return STATE_POSITIONING_SHAPE
+    except Exception as e:
+        logger.error(f"Error changing shape 1 image: {e}")
+        await safe_edit_status_message(status_msg, f"❌ Failed to update Shape 1 image: {str(e)}")
+        return STATE_POSITIONING_SHAPE
+
+async def change_shape2_image_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Replace Shape 2 image and re-render."""
+    user_id = update.effective_user.id
+    status_msg = await update.message.reply_text("📥 Updating Shape 2 image...")
+    try:
+        file_obj = await update.message.photo[-1].get_file()
+        shape2_path = os.path.join(BASE_DIR, f"user_shape2_img_{user_id}.jpg")
+        old_shape2 = context.user_data.get("temp_shape2_img_path")
+        clear_media_caches(shape2_path=old_shape2)
+        await file_obj.download_to_drive(shape2_path)
+        context.user_data["temp_shape2_img_path"] = shape2_path
+        
+        png_bytes = context.user_data.get("transparent_png_bytes")
+        bg_path = context.user_data.get("temp_bg_path")
+        shape_path = context.user_data.get("temp_shape_img_path")
+        font_choice = context.user_data.get("chosen_font", "faith")
+        color_choice = context.user_data.get("chosen_color", "yellow")
+        if font_choice == "freedom":
+            highlight_color = FREEDOM_WATERMARK_LINE_COLOR
+        else:
+            highlight_color = get_highlight_color(color_choice)
+        shape_type = "square" if font_choice == "maga" else "circle"
+        
+        offset_x = context.user_data.get("shape_offset_x", -275)
+        offset_y = context.user_data.get("shape_offset_y", 0)
+        scale = context.user_data.get("shape_scale", 1.0)
+        offset_x2 = context.user_data.get("shape2_offset_x", 275)
+        offset_y2 = context.user_data.get("shape2_offset_y", 0)
+        scale2 = context.user_data.get("shape2_scale", 1.0)
+        
+        combined_buffer = await asyncio.to_thread(
+            overlay_png_on_image,
+            bg_image_path=bg_path,
+            png_bytes=png_bytes,
+            shape_image_path=shape_path,
+            shape_type=shape_type,
+            border_color=highlight_color,
+            shape_offset_x=offset_x,
+            shape_offset_y=offset_y,
+            shape_scale=scale,
+            shape2_image_path=shape2_path,
+            shape2_offset_x=offset_x2,
+            shape2_offset_y=offset_y2,
+            shape2_scale=scale2,
+            line_bottom=context.user_data.get("line_bottom"),
+            preview_mode=True
+        )
+        context.user_data["last_rendered_image_bytes"] = combined_buffer.getvalue()
+        
+        move_step = context.user_data.get("shape_move_step", 25)
+        scale_step = context.user_data.get("shape_scale_step", 0.1)
+        active_shape = context.user_data.get("active_shape_editing", 2)
+        has_second_shape = True
+        
+        curr_offset_x = offset_x2 if active_shape == 2 else offset_x
+        curr_offset_y = offset_y2 if active_shape == 2 else offset_y
+        curr_scale = scale2 if active_shape == 2 else scale
+        
+        await safe_delete_message(status_msg)
+        await update.message.reply_photo(
+            photo=combined_buffer,
+            caption=(
+                f"✅ **Shape 2 image updated!**\n\n"
+                f"🎮 **Use the controls below to position Shape {active_shape}:**\n\n"
+                f"📍 Offset: ({curr_offset_x}px, {curr_offset_y}px) [Step: {move_step}px]\n"
+                f"🔎 Scale: {curr_scale:.2f}x [Step: {scale_step:.2f}x]\n\n"
+                "When satisfied, click **Done**!"
+            ),
+            reply_markup=shape_position_keyboard(move_step=move_step, scale_step=scale_step, active_shape=active_shape, has_second_shape=has_second_shape)
+        )
+        return STATE_POSITIONING_SHAPE
+    except Exception as e:
+        logger.error(f"Error changing shape 2 image: {e}")
+        await safe_edit_status_message(status_msg, f"❌ Failed to update Shape 2 image: {str(e)}")
+        return STATE_POSITIONING_SHAPE
+
+async def shape_image_direct_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles user uploading a photo directly during positioning mode."""
+    active_shape = context.user_data.get("active_shape_editing", 1)
+    if active_shape == 2:
+        return await change_shape2_image_received(update, context)
+    else:
+        return await change_shape1_image_received(update, context)
 
 async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Restarts the bot process."""
-    await update.message.reply_text("🔄 Restarting the bot, please wait...")
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-    return ConversationHandler.END
+    """Safely reset current user's session without killing the process or disrupting other users."""
+    user_id = update.effective_user.id
+    # Clean up user's temporary files
+    for pattern in [f"user_bg_img_{user_id}.jpg", f"user_shape_img_{user_id}.jpg", f"user_shape2_img_{user_id}.jpg", f"user_output_{user_id}.mp4"]:
+        path = os.path.join(BASE_DIR, pattern)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+    
+    # Clear user media caches
+    clear_media_caches(
+        os.path.join(BASE_DIR, f"user_bg_img_{user_id}.jpg"),
+        os.path.join(BASE_DIR, f"user_shape_img_{user_id}.jpg"),
+        os.path.join(BASE_DIR, f"user_shape2_img_{user_id}.jpg")
+    )
+    
+    # Reload saved style preferences from disk so user preferences are remembered
+    session = load_user_session(user_id)
+    context.user_data.clear()
+    if session:
+        context.user_data["chosen_font"] = session.get("chosen_font")
+        context.user_data["chosen_color"] = session.get("chosen_color")
+        context.user_data["doge_highlight_lines"] = session.get("doge_highlight_lines")
+    
+    font = context.user_data.get("chosen_font", "faith")
+    await update.message.reply_text(
+        f"🔄 **Session reset!**\n\n"
+        f"Selected Style: **{font.capitalize()}**\n\n"
+        "💬 Send the text you want in your text box to start fresh!"
+    )
+    return STATE_WAITING_TEXT
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel conversation flow."""
-    await update.message.reply_text("Cancelled. Send /start to begin again.")
+    """Cancel current conversation flow safely for this user."""
+    user_id = update.effective_user.id
+    for pattern in [f"user_bg_img_{user_id}.jpg", f"user_shape_img_{user_id}.jpg", f"user_shape2_img_{user_id}.jpg", f"user_output_{user_id}.mp4"]:
+        path = os.path.join(BASE_DIR, pattern)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+    session = load_user_session(user_id)
     context.user_data.clear()
+    if session:
+        context.user_data["chosen_font"] = session.get("chosen_font")
+        context.user_data["chosen_color"] = session.get("chosen_color")
+        context.user_data["doge_highlight_lines"] = session.get("doge_highlight_lines")
+    await update.message.reply_text("Session cancelled. Send /start or send text directly to begin again.")
     return ConversationHandler.END
 
 def run_test_renders():
@@ -3736,7 +4414,7 @@ def main():
         pool_timeout=30.0,
         media_write_timeout=120.0
     )
-    application = Application.builder().token(token).request(request).build()
+    application = Application.builder().token(token).request(request).concurrent_updates(True).build()
     
     conv_handler = ConversationHandler(
         entry_points=[
@@ -3777,13 +4455,15 @@ def main():
                 CommandHandler("done", skip_shape_image),
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex("^(?:/skip|/done|Done|done|Skip)$"), skip_shape_image),
                 CallbackQueryHandler(skip_shape_image, pattern="^bg_done$"),
+                CallbackQueryHandler(start_change_main_from_standard, pattern="^change:main$"),
                 MessageHandler(filters.PHOTO, shape_image_received),
                 CallbackQueryHandler(change_color, pattern="^recolor:"),
                 CallbackQueryHandler(change_font, pattern="^changefont$"),
                 CallbackQueryHandler(proofread_callback, pattern="^proofread:"),
             ],
             STATE_POSITIONING_SHAPE: [
-                CallbackQueryHandler(shape_position_callback, pattern="^pos:")
+                CallbackQueryHandler(shape_position_callback, pattern="^pos:"),
+                MessageHandler(filters.PHOTO, shape_image_direct_update),
             ],
             STATE_CONFIRM_IG_OCR: [
                 CallbackQueryHandler(ig_ocr_callback, pattern="^ig_ocr:"),
@@ -3792,12 +4472,25 @@ def main():
             ],
             STATE_WAITING_SHAPE2_IMAGE: [
                 MessageHandler(filters.PHOTO, shape2_image_received),
+                CallbackQueryHandler(cancel_change_callback, pattern="^cancel_change$"),
                 CallbackQueryHandler(shape_position_callback, pattern="^pos:")
             ],
             STATE_WAITING_DOGE_HIGHLIGHT_LINES: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, doge_highlight_lines_received),
                 CallbackQueryHandler(change_color, pattern="^recolor:"),
                 CallbackQueryHandler(change_font, pattern="^changefont$"),
+            ],
+            STATE_WAITING_CHANGE_MAIN: [
+                MessageHandler(filters.PHOTO, change_main_image_received),
+                CallbackQueryHandler(cancel_change_callback, pattern="^cancel_change$"),
+            ],
+            STATE_WAITING_CHANGE_SHAPE1: [
+                MessageHandler(filters.PHOTO, change_shape1_image_received),
+                CallbackQueryHandler(cancel_change_callback, pattern="^cancel_change$"),
+            ],
+            STATE_WAITING_CHANGE_SHAPE2: [
+                MessageHandler(filters.PHOTO, change_shape2_image_received),
+                CallbackQueryHandler(cancel_change_callback, pattern="^cancel_change$"),
             ]
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("restart", restart)],
@@ -3812,4 +4505,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
