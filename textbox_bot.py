@@ -815,10 +815,14 @@ async def safe_reply_caption(target_message, caption_text: str):
 def call_ocr_space(image_bytes: bytes) -> str:
     """Extract text from image bytes using OCR.space API."""
     url = "https://api.ocr.space/parse/image"
+    api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld")
     payload = {
-        "apikey": "helloworld",
+        "apikey": api_key,
         "language": "eng",
-        "isOverlayRequired": False
+        "isOverlayRequired": False,
+        "detectOrientation": True,
+        "scale": True,
+        "OCREngine": 2
     }
     files = {"file": ("image.jpg", image_bytes, "image/jpeg")}
     try:
@@ -831,6 +835,95 @@ def call_ocr_space(image_bytes: bytes) -> str:
     except Exception as e:
         logger.error(f"OCR.space request failed: {e}")
     return ""
+
+def clean_ocr_headline_with_ai(raw_text: str) -> str:
+    """Uses Groq AI to extract and clean ONLY the central headline/quote from screenshot OCR."""
+    if not raw_text or len(raw_text.strip()) < 5:
+        return ""
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key:
+        return raw_text.strip()
+        
+    system_prompt = "You are an expert OCR cleaner for social media graphics. Extract ONLY the exact headline text verbatim, removing surrounding UI."
+    user_prompt = f"""Raw OCR from a social media screenshot:
+---
+{raw_text}
+---
+
+Extract the central headline/quote text.
+CRITICAL RULES:
+1. Do NOT summarize, paraphrase, or change the wording. Keep the EXACT words verbatim.
+2. Strip phone UI (time, battery, LTE), app headers (usernames, follow buttons), interaction counters (likes, comments), audio tags, and comments/captions below the post.
+3. Strip secondary badges/logos (e.g. "MAGA", "SUPPORT ICE").
+4. Fix broken OCR fragments (e.g. "SHO\\nD" -> "SHOULD").
+5. Keep the text in ALL CAPS.
+6. Break into clean lines matching the original headline graphic (roughly 3-5 words per line, or 18-28 characters per line).
+7. If there is NO headline or quote in the text (e.g. only UI buttons or numbers), return NONE.
+8. Return ONLY the verbatim headline text. No explanations, no quotes."""
+
+    models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+    if os.getenv("GROQ_MODEL"):
+        models.insert(0, os.getenv("GROQ_MODEL"))
+    seen = set()
+    unique_models = [m for m in models if not (m in seen or seen.add(m))]
+
+    for model in unique_models:
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.0
+                },
+                timeout=12
+            )
+            if r.status_code == 200:
+                res = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                if res and res != "NONE" and "NONE" not in res[:10] and not is_ai_refusal(res):
+                    return res
+        except Exception as e:
+            logger.warning(f"Groq OCR cleanup error with model {model}: {e}")
+            continue
+    return ""
+
+def get_rendered_textbox_keyboard(font_choice: str = "faith") -> InlineKeyboardMarkup:
+    """Build the inline keyboard shown after a text box is rendered."""
+    font_choice = (font_choice or "faith").lower()
+    if font_choice == "freedom":
+        keyboard = [
+            [
+                InlineKeyboardButton("✏️ Edit Text", callback_data="edit_text"),
+                InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
+            ]
+        ]
+    else:
+        keyboard = [
+            [
+                InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
+                InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
+            ],
+            [
+                InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
+                InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
+            ],
+            [
+                InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
+                InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
+            ],
+            [
+                InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
+            ],
+            [
+                InlineKeyboardButton("✏️ Edit Text", callback_data="edit_text"),
+                InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
+            ]
+        ]
+    return InlineKeyboardMarkup(keyboard)
 
 async def safe_delete_message(msg):
     """Safely delete a message without raising unhandled errors if already deleted or timed out."""
@@ -1813,14 +1906,14 @@ async def font_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 context.user_data["line_bottom"] = line_bottom
                 save_user_session(update.effective_user.id, chosen_font="freedom", chosen_color="orange", last_text=last_text, line_bottom=line_bottom)
                 
-                keyboard = [[InlineKeyboardButton("🔄 Change Font", callback_data="changefont")]]
+                reply_markup = get_rendered_textbox_keyboard("freedom")
                 await send_rendered_media_with_retry(
                     query.message,
                     png_bytes,
                     filename="freedom_textbox.png",
                     as_document=True,
                     caption="✅ Switched to **Freedom** style!",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
+                    reply_markup=reply_markup
                 )
                 await safe_delete_message(status_msg)
                 await query.message.reply_text(
@@ -1923,27 +2016,7 @@ async def color_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context.user_data["line_bottom"] = line_bottom
             save_user_session(update.effective_user.id, chosen_font=font_choice, chosen_color=color_choice, doge_highlight_lines=doge_lines, last_text=last_text, line_bottom=line_bottom)
             
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
-                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            reply_markup = get_rendered_textbox_keyboard(font_choice)
             caption_text = f"✅ **{font_choice.capitalize()}** transparent text box generated!"
             as_doc = font_choice in ("maga", "charlie", "faith", "freedom", "doge")
             await send_rendered_media_with_retry(
@@ -2026,46 +2099,7 @@ async def change_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             context.user_data["line_bottom"] = line_bottom
             save_user_session(update.effective_user.id, chosen_font=font_choice, chosen_color=color_choice, doge_highlight_lines=doge_lines, last_text=last_text, line_bottom=line_bottom)
             
-            # Build post-render keyboard with color change + font change options
-            if font_choice in ("maga", "charlie", "maga_charlie", "faith", "doge"):
-                keyboard = [
-                    [
-                        InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                        InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                    ],
-                    [
-                        InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
-                        InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
-                    ],
-                    [
-                        InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                        InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                    ],
-                    [
-                        InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                    ],
-                    [
-                        InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                    ]
-                ]
-            else:
-                keyboard = [
-                    [
-                        InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                        InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                    ],
-                    [
-                        InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                        InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                    ],
-                    [
-                        InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                    ],
-                    [
-                        InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                    ]
-                ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            reply_markup = get_rendered_textbox_keyboard(font_choice)
             
             caption_text = (
                 f"✅ **{font_choice.capitalize()}** text box with **{color_name}** highlight!\n\n"
@@ -2145,17 +2179,143 @@ async def change_font(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     )
     return STATE_CHOOSING_FONT
 
-async def image_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """If text box already generated, treat incoming photo as background. Otherwise prompt for text."""
-    restore_session_if_needed(update, context)
-    png_bytes = context.user_data.get("transparent_png_bytes")
-    last_text = context.user_data.get("last_text")
-    if png_bytes or last_text:
-        return await background_received(update, context)
+async def edit_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Prompt the user to send their edited text with one-tap copy."""
+    query = update.callback_query
+    await query.answer()
+    
+    last_text = context.user_data.get("last_text", "")
+    if last_text:
+        await query.message.reply_text(
+            "✏️ **Tap the text box below to copy it, make your changes, and send it back to re-render:**\n\n"
+            f"`{last_text}`",
+            parse_mode="Markdown"
+        )
+    else:
+        await query.message.reply_text("💬 Please send the new text you would like to render:")
+    return STATE_WAITING_TEXT
+
+async def ocr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Prompt user to send a screenshot for OCR extraction."""
     await update.message.reply_text(
-        "💬 Please send text first to generate your text box. Once created, you can send photos or videos to overlay behind it!"
+        "📸 **Send me any screenshot or image now!**\n\n"
+        "I'll automatically detect and extract the headline text with AI, then render your text box."
     )
     return STATE_WAITING_TEXT
+
+async def image_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Auto-detects and extracts headline from screenshots using OCR + Groq AI and renders immediately."""
+    restore_session_if_needed(update, context)
+    
+    # 1. Get the image file
+    photo_file = None
+    if update.message.photo:
+        photo_file = await update.message.photo[-1].get_file()
+    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
+        photo_file = await update.message.document.get_file()
+        
+    if not photo_file:
+        await update.message.reply_text("❌ Please send a valid photo or screenshot.")
+        return STATE_WAITING_TEXT
+        
+    status_msg = await update.message.reply_text("🔍 Analyzing screenshot & extracting headline with AI...")
+    try:
+        img_bytes = await photo_file.download_as_bytearray()
+        img_bytes = bytes(img_bytes)
+        
+        # 2. Extract raw OCR text via OCR.space
+        raw_ocr = await asyncio.to_thread(call_ocr_space, img_bytes)
+        
+        # 3. Clean and isolate headline using Groq AI
+        extracted_headline = await asyncio.to_thread(clean_ocr_headline_with_ai, raw_ocr)
+        
+        if not extracted_headline or len(extracted_headline.strip()) < 5:
+            # If no headline found, check if user had previous text box and meant this as background
+            png_bytes = context.user_data.get("transparent_png_bytes")
+            last_text = context.user_data.get("last_text")
+            if png_bytes or last_text:
+                await safe_edit_status_message(status_msg, "ℹ️ No headline text detected in this image. Applying as background...")
+                return await background_received(update, context)
+                
+            await safe_edit_status_message(
+                status_msg,
+                "🤔 Couldn't detect any clear headline or quote text in this screenshot.\n\n"
+                "💡 **Tips:**\n"
+                "• Send a screenshot containing a headline, quote, or news graphic\n"
+                "• Or type your text directly in chat!"
+            )
+            return STATE_WAITING_TEXT
+
+        await safe_delete_message(status_msg)
+        
+        # Display extracted text clearly to user
+        await update.message.reply_text(
+            f"📸 **Extracted Headline:**\n\n`{extracted_headline}`",
+            parse_mode="Markdown"
+        )
+        
+        # Setup session for render
+        context.user_data["last_text"] = extracted_headline
+        font_choice = context.user_data.get("chosen_font", "faith")
+        
+        if font_choice == "charlie":
+            charlie_colors = ["yellow", "red", "orange", "magenta", "green", "blue", "purple"]
+            current_index = context.user_data.get("charlie_color_index", 0)
+            color_choice = charlie_colors[current_index]
+            context.user_data["chosen_color"] = color_choice
+            context.user_data["charlie_color_index"] = (current_index + 1) % len(charlie_colors)
+        elif font_choice == "maga":
+            maga_colors = ["yellow", "red", "orange", "magenta", "green", "blue", "purple"]
+            current_index = context.user_data.get("maga_color_index", 0)
+            color_choice = maga_colors[current_index]
+            context.user_data["chosen_color"] = color_choice
+            context.user_data["maga_color_index"] = (current_index + 1) % len(maga_colors)
+        elif font_choice == "freedom":
+            color_choice = "orange"
+            context.user_data["chosen_color"] = "orange"
+        else:
+            color_choice = context.user_data.get("chosen_color", "yellow")
+            
+        render_status = await update.message.reply_text("🎨 Rendering your text box, please wait...")
+        user_support_image_path = context.user_data.get("user_support_image_path")
+        image_buffer, line_bottom = await asyncio.to_thread(
+            generate_textbox_image,
+            extracted_headline, font_choice, color_choice, user_support_image_path=user_support_image_path
+        )
+        
+        png_bytes = image_buffer.getvalue()
+        context.user_data["transparent_png_bytes"] = png_bytes
+        context.user_data["last_rendered_image_bytes"] = png_bytes
+        context.user_data["line_bottom"] = line_bottom
+        save_user_session(update.effective_user.id, chosen_font=font_choice, chosen_color=color_choice, last_text=extracted_headline, line_bottom=line_bottom)
+        
+        reply_markup = get_rendered_textbox_keyboard(font_choice)
+        as_doc = font_choice in ("maga", "charlie", "faith", "freedom", "doge")
+        await send_rendered_media_with_retry(
+            update.message,
+            png_bytes,
+            filename=f"{font_choice}_textbox.png",
+            as_document=as_doc,
+            caption=f"✅ **{font_choice.capitalize()}** transparent text box generated from screenshot!",
+            reply_markup=reply_markup
+        )
+        await safe_delete_message(render_status)
+        
+        bg_keyboard = [
+            [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
+        ]
+        await update.message.reply_text(
+            "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+            "📥 **Send an image or a video now** to blend it,\n"
+            "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
+            reply_markup=InlineKeyboardMarkup(bg_keyboard)
+        )
+        return STATE_WAITING_BACKGROUND
+        
+    except Exception as e:
+        logger.error(f"Error processing screenshot OCR: {e}")
+        await safe_edit_status_message(status_msg, f"❌ Error processing screenshot: {str(e)}")
+        return STATE_WAITING_TEXT
 
 async def clear_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Inform user that custom images feature is disabled."""
@@ -2332,52 +2492,7 @@ async def text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         }
         color_name = color_names.get(color_choice, color_choice.capitalize())
         
-        # Build post-render keyboard
-        if font_choice == "freedom":
-            keyboard = [
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-        elif font_choice in ("maga", "charlie", "maga_charlie", "faith"):
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
-                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-        else:
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup = get_rendered_textbox_keyboard(font_choice)
         
         caption_text = f"✅ **{font_choice.capitalize()}** transparent text box generated!"
         as_doc = font_choice in ("maga", "charlie", "faith", "freedom", "doge")
@@ -2496,28 +2611,7 @@ async def doge_highlight_lines_received(update: Update, context: ContextTypes.DE
         }
         color_name = color_names.get(color_choice, color_choice.capitalize())
         
-        # Build post-render keyboard
-        keyboard = [
-            [
-                InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-            ],
-            [
-                InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
-                InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
-            ],
-            [
-                InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-            ],
-            [
-                InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-            ],
-            [
-                InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup = get_rendered_textbox_keyboard("doge")
         
         caption_text = f"✅ **Doge** transparent text box generated!"
         await send_rendered_media_with_retry(
@@ -2609,8 +2703,7 @@ async def ig_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["transparent_png_bytes"] = png_bytes
             context.user_data["line_bottom"] = line_bottom
             save_user_session(update.effective_user.id, chosen_font="freedom", chosen_color=color_choice, last_text=chosen_text, line_bottom=line_bottom)
-            keyboard = [[InlineKeyboardButton("🔄 Change Font", callback_data="changefont")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            reply_markup = get_rendered_textbox_keyboard("freedom")
             caption_text = "✅ **Freedom** transparent text box generated!"
             await send_rendered_media_with_retry(
                 query.message,
@@ -2660,27 +2753,7 @@ async def ig_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["line_bottom"] = line_bottom
             save_user_session(update.effective_user.id, chosen_font="charlie", chosen_color=color_choice, last_text=chosen_text, line_bottom=line_bottom)
             
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
-                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            reply_markup = get_rendered_textbox_keyboard(font_choice)
             
             caption_text = f"✅ **Charlie** transparent text box generated with auto-cycled color!"
             await send_rendered_media_with_retry(
@@ -2737,27 +2810,7 @@ async def ig_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["line_bottom"] = line_bottom
             save_user_session(update.effective_user.id, chosen_font="maga", chosen_color=color_choice, last_text=text, line_bottom=line_bottom)
             
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
-                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            reply_markup = get_rendered_textbox_keyboard(font_choice)
             
             caption_text = f"✅ **Maga** transparent text box generated with auto-cycled color!"
             await send_rendered_media_with_retry(
@@ -2879,8 +2932,7 @@ async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data["transparent_png_bytes"] = png_bytes
             context.user_data["line_bottom"] = line_bottom
             save_user_session(update.effective_user.id, chosen_font="freedom", chosen_color=color_choice, last_text=text, line_bottom=line_bottom)
-            keyboard = [[InlineKeyboardButton("🔄 Change Font", callback_data="changefont")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            reply_markup = get_rendered_textbox_keyboard("freedom")
             caption_text = "✅ **Freedom** transparent text box generated!"
             await send_rendered_media_with_retry(
                 update.message,
@@ -2930,27 +2982,7 @@ async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data["line_bottom"] = line_bottom
             save_user_session(update.effective_user.id, chosen_font="charlie", chosen_color=color_choice, last_text=text, line_bottom=line_bottom)
             
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
-                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            reply_markup = get_rendered_textbox_keyboard(font_choice)
             
             caption_text = f"✅ **Charlie** transparent text box generated with auto-cycled color!"
             await send_rendered_media_with_retry(
@@ -3007,27 +3039,7 @@ async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data["line_bottom"] = line_bottom
             save_user_session(update.effective_user.id, chosen_font="maga", chosen_color=color_choice, last_text=text, line_bottom=line_bottom)
             
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
-                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            reply_markup = get_rendered_textbox_keyboard(font_choice)
             
             caption_text = f"✅ **Maga** transparent text box generated with auto-cycled color!"
             await send_rendered_media_with_retry(
@@ -3147,45 +3159,7 @@ async def color_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         }
         color_name = color_names.get(color_choice, color_choice.capitalize())
         
-        if font_choice in ("maga", "charlie", "maga_charlie", "faith"):
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
-                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-        else:
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup = get_rendered_textbox_keyboard(font_choice)
         
         caption_text = f"✅ **{font_choice.capitalize()}** transparent text box generated!"
         as_doc = font_choice in ("maga", "charlie", "faith", "freedom", "doge")
@@ -3285,51 +3259,7 @@ async def proofread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         }
         color_name = color_names.get(color_choice, color_choice.capitalize())
         
-        if font_choice == "freedom":
-            keyboard = [
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-        elif font_choice in ("maga", "charlie", "maga_charlie", "faith", "doge"):
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
-                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-        else:
-            keyboard = [
-                [
-                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
-                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
-                ],
-                [
-                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
-                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
-                ],
-                [
-                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
-                ],
-                [
-                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
-                ]
-            ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup = get_rendered_textbox_keyboard(font_choice)
         
         caption_text = f"✅ **{font_choice.capitalize()}** transparent text box generated with corrected text!"
         as_doc = font_choice in ("maga", "charlie", "faith", "doge", "freedom")
@@ -4614,7 +4544,9 @@ def main():
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("clear_image", clear_image),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, text_received)
+            CommandHandler("ocr", ocr_command),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, text_received),
+            MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_received)
         ],
         states={
             STATE_CHOOSING_FONT: [
@@ -4627,32 +4559,39 @@ def main():
             ],
             STATE_WAITING_TEXT: [
                 CommandHandler("clear_image", clear_image),
+                CommandHandler("ocr", ocr_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_received),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_received),
                 CallbackQueryHandler(change_color, pattern="^recolor:"),
                 CallbackQueryHandler(change_font, pattern="^changefont$"),
+                CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(proofread_callback, pattern="^proofread:"),
             ],
             STATE_WAITING_BACKGROUND: [
                 CommandHandler("skip", skip_background),
                 CommandHandler("done", skip_background),
+                CommandHandler("ocr", ocr_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex("^(?:/skip|/done|Done|done|Skip)$"), skip_background),
                 CallbackQueryHandler(skip_background, pattern="^bg_done$"),
                 MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, background_received),
                 CallbackQueryHandler(instagram_background_callback, pattern="^ig_bg:"),
                 CallbackQueryHandler(change_color, pattern="^recolor:"),
                 CallbackQueryHandler(change_font, pattern="^changefont$"),
+                CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(proofread_callback, pattern="^proofread:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, text_received),
             ],
             STATE_WAITING_SHAPE_IMAGE: [
                 CommandHandler("skip", skip_shape_image),
                 CommandHandler("done", skip_shape_image),
+                CommandHandler("ocr", ocr_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex("^(?:/skip|/done|Done|done|Skip)$"), skip_shape_image),
                 CallbackQueryHandler(skip_shape_image, pattern="^bg_done$"),
                 CallbackQueryHandler(start_change_main_from_standard, pattern="^change:main$"),
                 MessageHandler(filters.PHOTO, shape_image_received),
                 CallbackQueryHandler(change_color, pattern="^recolor:"),
                 CallbackQueryHandler(change_font, pattern="^changefont$"),
+                CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(proofread_callback, pattern="^proofread:"),
             ],
             STATE_POSITIONING_SHAPE: [
@@ -4673,6 +4612,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, doge_highlight_lines_received),
                 CallbackQueryHandler(change_color, pattern="^recolor:"),
                 CallbackQueryHandler(change_font, pattern="^changefont$"),
+                CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
             ],
             STATE_WAITING_CHANGE_MAIN: [
                 MessageHandler(filters.PHOTO, change_main_image_received),
@@ -4687,7 +4627,7 @@ def main():
                 CallbackQueryHandler(cancel_change_callback, pattern="^cancel_change$"),
             ]
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("restart", restart)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("restart", restart), CommandHandler("ocr", ocr_command)],
         per_message=False,
     )
     
