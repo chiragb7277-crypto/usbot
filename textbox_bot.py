@@ -2160,6 +2160,12 @@ async def text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         color_choice = charlie_colors[current_index]
         context.user_data["chosen_color"] = color_choice
         context.user_data["charlie_color_index"] = (current_index + 1) % len(charlie_colors)
+    elif font_choice == "maga":
+        maga_colors = ["yellow", "red", "orange", "magenta", "green", "blue", "purple"]
+        current_index = context.user_data.get("maga_color_index", 0)
+        color_choice = maga_colors[current_index]
+        context.user_data["chosen_color"] = color_choice
+        context.user_data["maga_color_index"] = (current_index + 1) % len(maga_colors)
     elif font_choice == "freedom":
         color_choice = "orange"
         context.user_data["chosen_color"] = "orange"
@@ -2693,7 +2699,83 @@ async def ig_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await safe_edit_status_message(status_msg, err_msg)
             return STATE_WAITING_TEXT
             
-    if font_choice in ("maga", "charlie", "maga_charlie", "faith"):
+    if font_choice == "maga":
+        maga_colors = ["yellow", "red", "orange", "magenta", "green", "blue", "purple"]
+        current_index = context.user_data.get("maga_color_index", 0)
+        color_choice = maga_colors[current_index]
+        context.user_data["chosen_color"] = color_choice
+        context.user_data["maga_color_index"] = (current_index + 1) % len(maga_colors)
+        
+        status_msg = await update.message.reply_text("🎨 Rendering your text box, please wait...")
+        try:
+            user_support_image_path = context.user_data.get("user_support_image_path")
+            image_buffer, line_bottom = await asyncio.to_thread(
+                generate_textbox_image,
+                text, "maga", color_choice, user_support_image_path=user_support_image_path
+            )
+            
+            png_bytes = image_buffer.getvalue()
+            context.user_data["transparent_png_bytes"] = png_bytes
+            context.user_data["last_rendered_image_bytes"] = png_bytes
+            context.user_data["last_text"] = text
+            context.user_data["line_bottom"] = line_bottom
+            save_user_session(update.effective_user.id, chosen_font="maga", chosen_color=color_choice, last_text=text, line_bottom=line_bottom)
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
+                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
+                ],
+                [
+                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
+                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
+                ],
+                [
+                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
+                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
+                ],
+                [
+                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
+                ],
+                [
+                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            caption_text = f"✅ **Maga** transparent text box generated with auto-cycled color!"
+            await send_rendered_media_with_retry(
+                update.message,
+                png_bytes,
+                filename="maga_textbox.png",
+                as_document=True,
+                caption=caption_text,
+                reply_markup=reply_markup
+            )
+            await safe_delete_message(status_msg)
+            
+            bg_keyboard = [
+                [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
+            ]
+            await update.message.reply_text(
+                "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+                "📥 **Send an image or a video now** to blend it,\n"
+                "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
+                reply_markup=InlineKeyboardMarkup(bg_keyboard)
+            )
+            return STATE_WAITING_BACKGROUND
+            
+        except Exception as e:
+            logger.error(f"Failed to generate/send image in OCR flow for Maga: {e}")
+            err_msg = (
+                "⚠️ Telegram connection timed out while sending the text box. Please try again."
+                if (isinstance(e, TimedOut) or "timed out" in str(e).lower())
+                else f"❌ Sorry, an error occurred during rendering: {str(e)}"
+            )
+            await safe_edit_status_message(status_msg, err_msg)
+            return STATE_WAITING_TEXT
+
+    if font_choice in ("charlie", "maga_charlie", "faith"):
         keyboard = [
             [
                 InlineKeyboardButton("🟡 Yellow (#ffde59)", callback_data="color_ocr:yellow"),
@@ -2887,7 +2969,83 @@ async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await safe_edit_status_message(status_msg, err_msg)
             return STATE_WAITING_TEXT
             
-    if font_choice in ("maga", "charlie", "maga_charlie", "faith"):
+    if font_choice == "maga":
+        maga_colors = ["yellow", "red", "orange", "magenta", "green", "blue", "purple"]
+        current_index = context.user_data.get("maga_color_index", 0)
+        color_choice = maga_colors[current_index]
+        context.user_data["chosen_color"] = color_choice
+        context.user_data["maga_color_index"] = (current_index + 1) % len(maga_colors)
+        
+        status_msg = await update.message.reply_text("🎨 Rendering your text box, please wait...")
+        try:
+            user_support_image_path = context.user_data.get("user_support_image_path")
+            image_buffer, line_bottom = await asyncio.to_thread(
+                generate_textbox_image,
+                text, "maga", color_choice, user_support_image_path=user_support_image_path
+            )
+            
+            png_bytes = image_buffer.getvalue()
+            context.user_data["transparent_png_bytes"] = png_bytes
+            context.user_data["last_rendered_image_bytes"] = png_bytes
+            context.user_data["last_text"] = text
+            context.user_data["line_bottom"] = line_bottom
+            save_user_session(update.effective_user.id, chosen_font="maga", chosen_color=color_choice, last_text=text, line_bottom=line_bottom)
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("🟡 Yellow", callback_data="recolor:yellow"),
+                    InlineKeyboardButton("🔴 Red", callback_data="recolor:red")
+                ],
+                [
+                    InlineKeyboardButton("🟠 Orange", callback_data="recolor:orange"),
+                    InlineKeyboardButton("🟣 Magenta", callback_data="recolor:magenta")
+                ],
+                [
+                    InlineKeyboardButton("🟢 Green", callback_data="recolor:green"),
+                    InlineKeyboardButton("🔵 Blue", callback_data="recolor:blue")
+                ],
+                [
+                    InlineKeyboardButton("🟪 Purple", callback_data="recolor:purple")
+                ],
+                [
+                    InlineKeyboardButton("🔄 Change Font", callback_data="changefont")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            caption_text = f"✅ **Maga** transparent text box generated with auto-cycled color!"
+            await send_rendered_media_with_retry(
+                update.message,
+                png_bytes,
+                filename="maga_textbox.png",
+                as_document=True,
+                caption=caption_text,
+                reply_markup=reply_markup
+            )
+            await safe_delete_message(status_msg)
+            
+            bg_keyboard = [
+                [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
+            ]
+            await update.message.reply_text(
+                "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+                "📥 **Send an image or a video now** to blend it,\n"
+                "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
+                reply_markup=InlineKeyboardMarkup(bg_keyboard)
+            )
+            return STATE_WAITING_BACKGROUND
+            
+        except Exception as e:
+            logger.error(f"Failed to generate/send image in OCR flow for Maga: {e}")
+            err_msg = (
+                "⚠️ Telegram connection timed out while sending the text box. Please try again."
+                if (isinstance(e, TimedOut) or "timed out" in str(e).lower())
+                else f"❌ Sorry, an error occurred during rendering: {str(e)}"
+            )
+            await safe_edit_status_message(status_msg, err_msg)
+            return STATE_WAITING_TEXT
+
+    if font_choice in ("charlie", "maga_charlie", "faith"):
         keyboard = [
             [
                 InlineKeyboardButton("🟡 Yellow (#ffde59)", callback_data="color_ocr:yellow"),
