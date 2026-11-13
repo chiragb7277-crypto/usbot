@@ -133,16 +133,22 @@ logger = logging.getLogger("textbox_bot")
 # Global high-performance caches for real-time 3D positioning
 REMBG_SESSION = None
 REMBG_LOCK = threading.Lock()
+# Per-cache locks so concurrent users don't corrupt shared dicts
+_CUTOUT_LOCK = threading.Lock()
+_SHAPE_LOCK = threading.Lock()
+_OVERLAY_LOCK = threading.Lock()
+_BG_CROPPED_LOCK = threading.Lock()
 
 def get_rembg_session():
     global REMBG_SESSION
-    if REMBG_SESSION is None:
-        try:
-            from rembg import new_session
-            # Use u2netp (lightweight 4.7MB model, ~35MB RAM) to comfortably fit within 512MB RAM
-            REMBG_SESSION = new_session("u2netp")
-        except Exception as e:
-            logger.error(f"Failed to create rembg session: {e}")
+    with REMBG_LOCK:
+        if REMBG_SESSION is None:
+            try:
+                from rembg import new_session
+                # Use u2netp (lightweight 4.7MB model, ~35MB RAM) to comfortably fit within 512MB RAM
+                REMBG_SESSION = new_session("u2netp")
+            except Exception as e:
+                logger.error(f"Failed to create rembg session: {e}")
     return REMBG_SESSION
 
 CUTOUT_CACHE = {}
@@ -175,9 +181,11 @@ def calculate_target_h(png_bytes: bytes, line_bottom: int = None) -> tuple:
         overlay = OVERLAY_CACHE[overlay_key]
     else:
         overlay = Image.open(BytesIO(png_bytes)).convert("RGBA")
-        if len(OVERLAY_CACHE) > 10:
-            OVERLAY_CACHE.clear()
-        OVERLAY_CACHE[overlay_key] = overlay
+        with _OVERLAY_LOCK:
+            if len(OVERLAY_CACHE) > 10:
+                oldest = next(iter(OVERLAY_CACHE))
+                OVERLAY_CACHE.pop(oldest, None)
+            OVERLAY_CACHE[overlay_key] = overlay
     
     if line_bottom is None:
         line_bottom = 0
@@ -207,8 +215,9 @@ def compute_and_cache_cutout(bg_image_path: str, target_h: int):
         return None
     bg_mtime = os.path.getmtime(bg_image_path)
     cutout_cache_key = (bg_image_path, bg_mtime, target_h)
-    if cutout_cache_key in CUTOUT_CACHE:
-        return CUTOUT_CACHE[cutout_cache_key]
+    with _CUTOUT_LOCK:
+        if cutout_cache_key in CUTOUT_CACHE:
+            return CUTOUT_CACHE[cutout_cache_key]
     try:
         bg_img = Image.open(bg_image_path).convert("RGBA")
         bg_enhanced = enhance_image_quality(bg_img)
@@ -227,10 +236,11 @@ def compute_and_cache_cutout(bg_image_path: str, target_h: int):
             top = (bg_enhanced.height - new_h) // 2
             crop_box = (0, top, bg_enhanced.width, top + new_h)
         cutout_cropped = cutout.crop(crop_box).resize((1080, target_h), Image.Resampling.LANCZOS)
-        if len(CUTOUT_CACHE) >= 20:
-            oldest_key = next(iter(CUTOUT_CACHE))
-            CUTOUT_CACHE.pop(oldest_key, None)
-        CUTOUT_CACHE[cutout_cache_key] = cutout_cropped
+        with _CUTOUT_LOCK:
+            if len(CUTOUT_CACHE) >= 20:
+                oldest_key = next(iter(CUTOUT_CACHE))
+                CUTOUT_CACHE.pop(oldest_key, None)
+            CUTOUT_CACHE[cutout_cache_key] = cutout_cropped
         logger.info(f"Background cutout generated and cached for {bg_image_path}")
         return cutout_cropped
     except Exception as e:
@@ -1477,9 +1487,11 @@ def create_subject_shape(img, size: int, shape_type: str, border_color: tuple, b
     
     canvas.paste(masked_img, (border_width, border_width), masked_img)
     if cache_key is not None:
-        if len(SHAPE_CACHE) > 50:
-            SHAPE_CACHE.clear()
-        SHAPE_CACHE[cache_key] = canvas
+        with _SHAPE_LOCK:
+            if len(SHAPE_CACHE) > 50:
+                oldest = next(iter(SHAPE_CACHE))
+                SHAPE_CACHE.pop(oldest, None)
+            SHAPE_CACHE[cache_key] = canvas
     return canvas
 
 def overlay_png_on_image(
@@ -1510,9 +1522,11 @@ def overlay_png_on_image(
         overlay = OVERLAY_CACHE[overlay_key]
     else:
         overlay = Image.open(BytesIO(png_bytes)).convert("RGBA")
-        if len(OVERLAY_CACHE) > 10:
-            OVERLAY_CACHE.clear()
-        OVERLAY_CACHE[overlay_key] = overlay
+        with _OVERLAY_LOCK:
+            if len(OVERLAY_CACHE) > 10:
+                oldest = next(iter(OVERLAY_CACHE))
+                OVERLAY_CACHE.pop(oldest, None)
+            OVERLAY_CACHE[overlay_key] = overlay
             
     # Check if this is a bottom-anchored overlay (Freedom style has solid box at the bottom y ~ 1340)
     is_bottom_anchored = (overlay.getpixel((540, 1340))[3] > 0)
@@ -1547,9 +1561,11 @@ def overlay_png_on_image(
                 crop_box = (0, top, bg_enhanced.width, top + new_h)
                 
             bg_cropped = bg_enhanced.crop(crop_box).resize((1080, target_h), Image.Resampling.LANCZOS)
-            if len(BG_CROPPED_CACHE) > 10:
-                BG_CROPPED_CACHE.clear()
-            BG_CROPPED_CACHE[bg_cache_key] = bg_cropped
+            with _BG_CROPPED_LOCK:
+                if len(BG_CROPPED_CACHE) > 10:
+                    oldest = next(iter(BG_CROPPED_CACHE))
+                    BG_CROPPED_CACHE.pop(oldest, None)
+                BG_CROPPED_CACHE[bg_cache_key] = bg_cropped
         
         # 1. Paste background image (bottom layer)
         canvas.paste(bg_cropped, (0, y_offset))
@@ -3741,7 +3757,7 @@ async def shape2_image_received(update: Update, context: ContextTypes.DEFAULT_TY
             shape_offset_y=context.user_data.get("shape_offset_y", 0),
             shape_scale=context.user_data.get("shape_scale", 1.0),
             shape2_image_path=shape2_path,
-            shape2_offset_x=context.user_data["shape2_offset_x"],
+            shape2_offset_x=context.user_data.get("shape2_offset_x", 275),
             shape2_offset_y=0,
             shape2_scale=1.0,
             line_bottom=context.user_data.get("line_bottom"),
@@ -3757,7 +3773,7 @@ async def shape2_image_received(update: Update, context: ContextTypes.DEFAULT_TY
             photo=combined_buffer,
             caption=(
                 "🎮 **Use the controls below to position Shape 2:**\n\n"
-                f"📍 Offset: ({context.user_data['shape2_offset_x']}px, 0px) [Step: {move_step}px]\n"
+                f"📍 Offset: ({context.user_data.get('shape2_offset_x', 275)}px, 0px) [Step: {move_step}px]\n"
                 f"🔎 Scale: 1.00x [Step: {scale_step:.2f}x]\n\n"
                 "When satisfied, click **Done**!"
             ),
