@@ -4389,7 +4389,27 @@ def main():
     if args.test_render:
         run_test_renders()
         sys.exit(0)
-        
+
+    # ── Single-instance guard ──────────────────────────────────────────────
+    # Prevents "Conflict: terminated by other getUpdates request" when two
+    # copies of the bot accidentally start at the same time.
+    PIDFILE = os.path.join(BASE_DIR, "textbox_bot.pid")
+    try:
+        if os.path.exists(PIDFILE):
+            old_pid = int(open(PIDFILE).read().strip())
+            try:
+                os.kill(old_pid, 0)   # check if process is still alive
+                print(f"[BOT] Killing stale bot instance PID {old_pid}...", flush=True)
+                os.kill(old_pid, 9)
+                time.sleep(1)
+            except ProcessLookupError:
+                pass  # Already gone — safe to proceed
+        with open(PIDFILE, "w") as _pf:
+            _pf.write(str(os.getpid()))
+    except Exception as _e:
+        print(f"[BOT] PID-lock warning: {_e}", flush=True)
+    # ── End single-instance guard ──────────────────────────────────────────
+
     # Standard bot run
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
