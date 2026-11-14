@@ -4942,49 +4942,89 @@ async def nodependency_command(update: Update, context: ContextTypes.DEFAULT_TYP
         
     return STATE_NODEP_COUNTS
 
+def _ask_photos_per_post_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1️⃣ 1 photo per post (main background only)", callback_data="nodep_ppp:1")],
+        [InlineKeyboardButton("2️⃣ 2 photos per post (main + shape cutout)", callback_data="nodep_ppp:2")],
+    ])
+
+def _build_dump_instructions(charlie_cnt: int, maga_cnt: int, photos_per_post: int) -> str:
+    total = charlie_cnt + maga_cnt
+    if photos_per_post == 1:
+        return (
+            f"✅ **Target:** {charlie_cnt} Charlie + {maga_cnt} MAGA = {total} posts | **1 photo each**\n\n"
+            f"📥 **Dump your files in this exact order for each post:**\n"
+            f"1. 📸 Screenshot (with the headline text)\n"
+            f"2. 🖼️ Main background photo (clean portrait/image)\n\n"
+            f"So for {total} posts → dump **{total} screenshots + {total} main photos** = **{total * 2} files total**\n\n"
+            "_Send everything now, then tap **Start Assembly**._"
+        )
+    else:
+        return (
+            f"✅ **Target:** {charlie_cnt} Charlie + {maga_cnt} MAGA = {total} posts | **2 photos each**\n\n"
+            f"📥 **Dump your files in this exact order, repeated for each post:**\n"
+            f"1. 📸 Screenshot (with the headline text)\n"
+            f"2. 🖼️ Main background photo (clean portrait)\n"
+            f"3. ✂️ Shape photo (the cutout placed in the circle/square)\n\n"
+            f"So for {total} posts → dump **{total*3} files total** (screenshot + main + shape, repeated)\n\n"
+            "_Send everything now, then tap **Start Assembly**._"
+        )
+
 async def nodep_counts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles style quantity selection."""
+    """Handles style quantity selection — then asks photos-per-post."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     
     data = query.data.split(":")
+
+    # Handle photos-per-post selection
+    if data[0] == "nodep_ppp":
+        ppp = int(data[1])
+        sess = context.user_data.setdefault("nodep_session", {})
+        sess["photos_per_post"] = ppp
+        charlie_cnt = sess.get("count_charlie", 1)
+        maga_cnt = sess.get("count_maga", 1)
+        _clean_nodep_directory(user_id)
+        sess["files"] = []
+        sess["last_dump_msg"] = None
+        total = charlie_cnt + maga_cnt
+        dump_kb = [
+            [InlineKeyboardButton("⚡ Start Assembly (0 files)", callback_data="nodep_action:start_assembly")],
+            [InlineKeyboardButton("❌ Cancel Batch", callback_data="nodep_action:cancel")]
+        ]
+        await query.message.reply_text(
+            _build_dump_instructions(charlie_cnt, maga_cnt, ppp),
+            reply_markup=InlineKeyboardMarkup(dump_kb),
+            parse_mode="Markdown"
+        )
+        return STATE_NODEP_DUMP
+
     if len(data) >= 3 and data[1] != "custom":
         charlie_cnt = int(data[1])
         maga_cnt = int(data[2])
-        _clean_nodep_directory(user_id)
-        
         sess = context.user_data.setdefault("nodep_session", {})
         sess["count_charlie"] = charlie_cnt
         sess["count_maga"] = maga_cnt
         sess["files"] = []
         sess["last_dump_msg"] = None
         
-        dump_kb = [
-            [InlineKeyboardButton("⚡ Start Assembly (0 files received)", callback_data="nodep_action:start_assembly")],
-            [InlineKeyboardButton("❌ Cancel Batch", callback_data="nodep_action:cancel")]
-        ]
-        
         await query.message.reply_text(
-            f"✅ **Target Selected:** {charlie_cnt} Charlie, {maga_cnt} MAGA ({charlie_cnt + maga_cnt} total)\n\n"
-            "📥 **Now DUMP all your files together in this chat!**\n\n"
-            "Send as many as you have:\n"
-            "• 📸 **Screenshots** (with text/headlines to OCR)\n"
-            "• 👤 **Clean Photos** (portraits, subjects, backgrounds)\n\n"
-            "Send them all now! When you finish, tap **Start Assembly** below.",
-            reply_markup=InlineKeyboardMarkup(dump_kb),
+            f"✅ **{charlie_cnt} Charlie + {maga_cnt} MAGA selected!**\n\n"
+            "📸 **Now: how many photos do you have per post?**",
+            reply_markup=_ask_photos_per_post_keyboard(),
             parse_mode="Markdown"
         )
-        return STATE_NODEP_DUMP
+        return STATE_NODEP_COUNTS
         
     elif data[1] == "custom":
         await query.message.reply_text(
-            "💬 **Please reply with your desired counts** (e.g. `2 Charlie 3 MAGA` or just `2 3`):"
+            "💬 **Reply with your desired counts** (e.g. `2 Charlie 3 MAGA` or just `2 3`):"
         )
         return STATE_NODEP_COUNTS
 
 async def nodep_custom_counts_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Parses custom text counts from user."""
+    """Parses custom text counts from user, then asks photos-per-post."""
     text = update.message.text.strip()
     user_id = update.effective_user.id
     nums = [int(n) for n in re.findall(r'\d+', text)]
@@ -5002,19 +5042,13 @@ async def nodep_custom_counts_text(update: Update, context: ContextTypes.DEFAULT
     sess["files"] = []
     sess["last_dump_msg"] = None
     
-    dump_kb = [
-        [InlineKeyboardButton("⚡ Start Assembly (0 files received)", callback_data="nodep_action:start_assembly")],
-        [InlineKeyboardButton("❌ Cancel Batch", callback_data="nodep_action:cancel")]
-    ]
-    
     await update.message.reply_text(
-        f"✅ **Target Set:** {charlie_cnt} Charlie, {maga_cnt} MAGA ({charlie_cnt + maga_cnt} total)\n\n"
-        "📥 **Dump all your screenshots and clean photos now!**\n"
-        "When finished uploading, tap **Start Assembly** below.",
-        reply_markup=InlineKeyboardMarkup(dump_kb),
+        f"✅ **{charlie_cnt} Charlie + {maga_cnt} MAGA selected!**\n\n"
+        "📸 **Now: how many photos do you have per post?**",
+        reply_markup=_ask_photos_per_post_keyboard(),
         parse_mode="Markdown"
     )
-    return STATE_NODEP_DUMP
+    return STATE_NODEP_COUNTS
 
 async def nodep_file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Collects dumped media files in No-Dependency mode. Keeps a single live counter message."""
@@ -5146,9 +5180,9 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
         charlie_colors = ["yellow", "red", "orange", "magenta", "green", "blue", "purple"]
         maga_colors = ["yellow", "red", "orange", "magenta", "green", "blue", "purple"]
         
+        ppp = sess.get("photos_per_post", 1)
         queue = []
         remaining_clean = list(clean_images)
-        # Build exactly as many posts as the user asked for, cycling screenshots if fewer than target
         target_count = max(total_target, len(screenshots))
         
         await safe_edit_status_message(status_msg, f"🔗 Matching {len(screenshots)} screenshot(s) to {len(clean_images)} photo(s)...")
@@ -5158,20 +5192,39 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
             ss_path = ss_item["path"]
             headline = ss_item["headline"]
             
-            # Match screenshot to best clean photo from available clean images
-            if not remaining_clean:
-                remaining_clean = list(clean_images)
-                
-            matched_bg = match_screenshot_to_images(ss_path, remaining_clean)
-            if matched_bg in remaining_clean:
-                remaining_clean.remove(matched_bg)
-                
+            matched_bg = None
+            matched_shape = None
+            
+            if ppp == 2 and len(clean_images) >= (idx + 1) * 2:
+                # Direct sequence pair for this post: [main, shape]
+                matched_bg = clean_images[idx * 2]
+                matched_shape = clean_images[idx * 2 + 1]
+                if matched_bg in remaining_clean:
+                    remaining_clean.remove(matched_bg)
+                if matched_shape in remaining_clean:
+                    remaining_clean.remove(matched_shape)
+            else:
+                if not remaining_clean:
+                    remaining_clean = list(clean_images)
+                matched_bg = match_screenshot_to_images(ss_path, remaining_clean)
+                if matched_bg in remaining_clean:
+                    remaining_clean.remove(matched_bg)
+                    
+                if ppp == 2:
+                    if remaining_clean:
+                        matched_shape = remaining_clean.pop(0)
+                    elif len(clean_images) > 1:
+                        other_imgs = [c for c in clean_images if c != matched_bg]
+                        if other_imgs:
+                            matched_shape = other_imgs[0]
+                            
             style = style_list[idx % len(style_list)]
             color = charlie_colors[idx % len(charlie_colors)] if style == "charlie" else maga_colors[idx % len(maga_colors)]
             
+            shape_log = f" -> shape={os.path.basename(matched_shape)}" if matched_shape else ""
             logger.info(
                 f"Queue[{idx}]: style={style} | color={color} | "
-                f"ss={os.path.basename(ss_path)} -> bg={os.path.basename(matched_bg)}"
+                f"ss={os.path.basename(ss_path)} -> bg={os.path.basename(matched_bg)}{shape_log}"
             )
             
             queue.append({
@@ -5179,6 +5232,10 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
                 "color": color,
                 "headline": headline,
                 "bg_path": matched_bg,
+                "shape_path": matched_shape,
+                "shape_offset_x": 0,
+                "shape_offset_y": 0,
+                "shape_scale": 1.0,
                 "clean_candidates": list(clean_images),
                 "rendered_bytes": None
             })
@@ -5191,9 +5248,10 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
         # Show the user a summary of what was matched before rendering starts
         summary_lines = [f"✅ **{len(screenshots)} screenshot(s), {len(clean_images)} photo(s) — {len(queue)} posts queued**\n"]
         for i, entry in enumerate(queue):
+            shape_info = f" | Shape: `{os.path.basename(entry['shape_path'])}`" if entry.get("shape_path") else ""
             summary_lines.append(
                 f"• Post {i+1}: **{entry['style'].upper()}** | {entry['color'].capitalize()} | "
-                f"BG: `{os.path.basename(entry['bg_path'])}`"
+                f"Main: `{os.path.basename(entry['bg_path'])}`{shape_info}"
             )
         summary_lines.append("\n_Rendering now…_")
         await safe_edit_status_message(status_msg, "\n".join(summary_lines), parse_mode="Markdown")
@@ -5226,6 +5284,11 @@ async def nodep_render_and_display_current(target_msg, context: ContextTypes.DEF
     color = post["color"]
     headline = post["headline"]
     bg_path = post["bg_path"]
+    shape_path = post.get("shape_path")
+    shape_offset_x = post.get("shape_offset_x", 0)
+    shape_offset_y = post.get("shape_offset_y", 0)
+    shape_scale = post.get("shape_scale", 1.0)
+    has_shape = bool(shape_path and os.path.exists(shape_path))
     
     status = await target_msg.reply_text(f"🎨 Rendering Post {idx + 1}/{len(queue)} ({style.upper()} - {color.capitalize()})...")
     
@@ -5240,17 +5303,17 @@ async def nodep_render_and_display_current(target_msg, context: ContextTypes.DEF
         highlight_color = FREEDOM_WATERMARK_LINE_COLOR if style == "freedom" else get_highlight_color(color)
         shape_type = "square" if style == "maga" else "circle"
         
-        # 2. Composite over matched background
+        # 2. Composite over matched background with shape cutout if present
         composite_buffer = await asyncio.to_thread(
             overlay_png_on_image,
             bg_path, png_bytes,
-            shape_image_path=None,
+            shape_image_path=shape_path if has_shape else None,
             shape_type=shape_type,
             border_color=highlight_color,
-            shape_offset_x=0,
-            shape_offset_y=0,
-            shape_scale=1.0,
-            simple_overlay=True,
+            shape_offset_x=shape_offset_x,
+            shape_offset_y=shape_offset_y,
+            shape_scale=shape_scale,
+            simple_overlay=not has_shape,
             line_bottom=line_bottom
         )
         rendered_bytes = composite_buffer.getvalue()
@@ -5261,6 +5324,12 @@ async def nodep_render_and_display_current(target_msg, context: ContextTypes.DEF
         context.user_data["transparent_png_bytes"] = png_bytes
         context.user_data["last_rendered_image_bytes"] = rendered_bytes
         context.user_data["temp_bg_path"] = bg_path
+        context.user_data["user_shape_image_path"] = shape_path
+        context.user_data["shape_type"] = shape_type
+        context.user_data["border_color"] = highlight_color
+        context.user_data["shape_offset_x"] = shape_offset_x
+        context.user_data["shape_offset_y"] = shape_offset_y
+        context.user_data["shape_scale"] = shape_scale
         context.user_data["last_text"] = headline
         context.user_data["chosen_font"] = style
         context.user_data["chosen_color"] = color
@@ -5272,14 +5341,15 @@ async def nodep_render_and_display_current(target_msg, context: ContextTypes.DEF
         keyboard = [
             [
                 InlineKeyboardButton("✏️ Edit Text", callback_data="nodep_act:edit_text"),
-                InlineKeyboardButton("🔄 Swap Image", callback_data="nodep_act:swap_image")
+                InlineKeyboardButton("🎨 Color", callback_data="nodep_act:change_color"),
+                InlineKeyboardButton(f"🔄 {('MAGA' if style == 'charlie' else 'Charlie')}", callback_data="nodep_act:toggle_style")
             ],
             [
-                InlineKeyboardButton("🎨 Change Color", callback_data="nodep_act:change_color"),
-                InlineKeyboardButton(f"🔄 Switch Style ({('MAGA' if style == 'charlie' else 'Charlie')})", callback_data="nodep_act:toggle_style")
+                InlineKeyboardButton("🖼️ Swap Main", callback_data="nodep_act:swap_image"),
+                InlineKeyboardButton("✂️ Swap Shape" if has_shape else "➕ Add Shape", callback_data="nodep_act:swap_shape")
             ],
             [
-                InlineKeyboardButton("🎮 Adjust Position / 3D Pop-Out", callback_data="nodep_act:position_3d")
+                InlineKeyboardButton("🎮 3D Pop-Out & Position", callback_data="nodep_act:position_3d")
             ],
             [
                 InlineKeyboardButton(f"✅ Next Post ({idx + 1}/{len(queue)}) ➡️", callback_data="nodep_act:next"),
@@ -5287,11 +5357,14 @@ async def nodep_render_and_display_current(target_msg, context: ContextTypes.DEF
             ]
         ]
         
+        shape_text = f"• Shape Cutout: `{os.path.basename(shape_path)}`\n" if has_shape else ""
         caption_text = (
             f"✨ **Post {idx + 1}/{len(queue)} Assembled!**\n"
-            f"• Style: **{style.upper()}** | Color: **{color.capitalize()}**\n\n"
+            f"• Style: **{style.upper()}** | Color: **{color.capitalize()}**\n"
+            f"• Main BG: `{os.path.basename(bg_path)}`\n"
+            f"{shape_text}\n"
             f"📝 **Headline:**\n`{headline}`\n\n"
-            "Use the controls below to change *anything* on this post, or tap Next!"
+            "Use the controls below to change anything, or tap Next!"
         )
         
         await target_msg.reply_photo(
@@ -5339,7 +5412,7 @@ async def nodep_review_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         # Send each clean photo as a visual thumbnail so the user can see what they're picking
         await query.message.reply_text(
-            f"🔄 **Choose a replacement photo for Post {idx + 1}:**\n"
+            f"🔄 **Choose a main background photo for Post {idx + 1}:**\n"
             "_Tap 'Use This Photo ✅' under the one you want, or send any new photo directly._",
             parse_mode="Markdown"
         )
@@ -5368,6 +5441,37 @@ async def nodep_review_callback(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back (keep current)", callback_data="nodep_act:back")]])
         )
         return STATE_NODEP_REVIEW
+
+    elif action == "swap_shape":
+        clean_images = sess.get("clean_images", [])
+        if not clean_images:
+            await query.message.reply_text("⚠️ No alternative photos found in this dump. Send any photo directly to set as shape!")
+            return STATE_NODEP_REVIEW
+
+        await query.message.reply_text(
+            f"✂️ **Choose a shape cutout photo for Post {idx + 1}:**\n"
+            "_Tap 'Use as Shape Cutout ✂️' under the photo you want:_",
+            parse_mode="Markdown"
+        )
+        for i, c_path in enumerate(clean_images):
+            is_current = (c_path == post.get("shape_path"))
+            label = "✅ Current Shape Cutout" if is_current else f"Use as Shape Cutout ({i+1}/{len(clean_images)})"
+            try:
+                with open(c_path, "rb") as img_f:
+                    await query.message.reply_photo(
+                        photo=img_f,
+                        caption=f"📸 Photo {i + 1}/{len(clean_images)}",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton(label, callback_data=f"nodep_setshape:{i}")
+                        ]])
+                    )
+            except Exception as e:
+                logger.warning(f"Could not send shape swap preview: {e}")
+        await query.message.reply_text(
+            "🔙 Tap the button under any photo above to set it as the shape cutout.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back (keep current)", callback_data="nodep_act:back")]])
+        )
+        return STATE_NODEP_REVIEW
         
     elif action == "change_color":
         palette_kb = [
@@ -5388,15 +5492,19 @@ async def nodep_review_callback(update: Update, context: ContextTypes.DEFAULT_TY
         # Launch standard 3D interactive controls for this post
         shape_type = "square" if post["style"] == "maga" else "circle"
         highlight_color = get_highlight_color(post["color"])
+        shape_path = post.get("shape_path")
+        has_shape = bool(shape_path and os.path.exists(shape_path))
         
         combined_buffer = await asyncio.to_thread(
             overlay_png_on_image,
             post["bg_path"], context.user_data["transparent_png_bytes"],
-            shape_image_path=None,
+            shape_image_path=shape_path if has_shape else None,
             shape_type=shape_type,
             border_color=highlight_color,
-            shape_offset_x=0, shape_offset_y=0, shape_scale=1.0,
-            simple_overlay=True,
+            shape_offset_x=post.get("shape_offset_x", 0),
+            shape_offset_y=post.get("shape_offset_y", 0),
+            shape_scale=post.get("shape_scale", 1.0),
+            simple_overlay=not has_shape,
             line_bottom=post.get("line_bottom")
         )
         await query.message.reply_photo(
@@ -5431,7 +5539,7 @@ async def nodep_review_callback(update: Update, context: ContextTypes.DEFAULT_TY
     return STATE_NODEP_REVIEW
 
 async def nodep_review_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """If user drops a photo while reviewing a batch post, replace the background and re-render."""
+    """If user drops a photo while reviewing, ask whether to use as Main or Shape."""
     user_id = update.effective_user.id
     photo_file = None
     if update.message.photo:
@@ -5444,20 +5552,43 @@ async def nodep_review_photo_received(update: Update, context: ContextTypes.DEFA
         
     save_dir = os.path.join(BASE_DIR, "scratch", f"nodep_{user_id}")
     os.makedirs(save_dir, exist_ok=True)
-    new_bg = os.path.join(save_dir, f"custom_bg_{int(time.time() * 1000)}_{uuid.uuid4().hex[:4]}.jpg")
+    new_bg = os.path.join(save_dir, f"custom_{int(time.time() * 1000)}_{uuid.uuid4().hex[:4]}.jpg")
     await photo_file.download_to_drive(new_bg)
     
     sess = context.user_data.get("nodep_session", {})
+    clean_images = sess.setdefault("clean_images", [])
+    if new_bg not in clean_images:
+        clean_images.append(new_bg)
+    new_idx = len(clean_images) - 1
+    
+    choice_kb = [
+        [
+            InlineKeyboardButton("🖼️ Set as Main BG", callback_data=f"nodep_setimg:{new_idx}"),
+            InlineKeyboardButton("✂️ Set as Shape Cutout", callback_data=f"nodep_setshape:{new_idx}")
+        ],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="nodep_act:back")]
+    ]
+    await update.message.reply_text(
+        "📸 **Photo received!** Where would you like to use this photo?",
+        reply_markup=InlineKeyboardMarkup(choice_kb)
+    )
+    return STATE_NODEP_REVIEW
+
+async def nodep_set_shape_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Sets the shape cutout image to the selected dump photo."""
+    query = update.callback_query
+    await query.answer()
+    
+    img_idx = int(query.data.split(":")[1])
+    sess = context.user_data.get("nodep_session", {})
+    clean_images = sess.get("clean_images", [])
     queue = sess.get("queue", [])
     curr_idx = sess.get("current_idx", 0)
     
-    if curr_idx < len(queue):
-        queue[curr_idx]["bg_path"] = new_bg
-        clean_images = sess.setdefault("clean_images", [])
-        if new_bg not in clean_images:
-            clean_images.append(new_bg)
-        await update.message.reply_text("✅ Background photo updated for this post!")
-        return await nodep_render_and_display_current(update.message, context)
+    if curr_idx < len(queue) and 0 <= img_idx < len(clean_images):
+        queue[curr_idx]["shape_path"] = clean_images[img_idx]
+        await query.message.reply_text(f"✅ Set Image #{img_idx + 1} as the shape cutout!")
+        return await nodep_render_and_display_current(query.message, context)
         
     return STATE_NODEP_REVIEW
 
@@ -5673,7 +5804,7 @@ def main():
                 CallbackQueryHandler(cancel_change_callback, pattern="^cancel_change$"),
             ],
             STATE_NODEP_COUNTS: [
-                CallbackQueryHandler(nodep_counts_callback, pattern="^nodep_cnt:"),
+                CallbackQueryHandler(nodep_counts_callback, pattern="^(?:nodep_cnt:|nodep_ppp:)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, nodep_custom_counts_text),
             ],
             STATE_NODEP_DUMP: [
@@ -5685,6 +5816,7 @@ def main():
             STATE_NODEP_REVIEW: [
                 CallbackQueryHandler(nodep_review_callback, pattern="^nodep_act:"),
                 CallbackQueryHandler(nodep_set_image_callback, pattern="^nodep_setimg:"),
+                CallbackQueryHandler(nodep_set_shape_callback, pattern="^nodep_setshape:"),
                 CallbackQueryHandler(nodep_set_color_callback, pattern="^nodep_setclr:"),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, nodep_review_photo_received),
             ],
