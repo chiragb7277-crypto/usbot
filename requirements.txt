@@ -19,3 +19,4 @@ rembg
 onnxruntime
 gradio
 python-dotenv
+emoji

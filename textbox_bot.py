@@ -981,6 +981,50 @@ def search_wikimedia_image(query: str) -> str:
         
     return None
 
+def match_screenshot_to_images(screenshot_path: str, candidate_paths: list) -> str:
+    """Finds the best matching clean photo for a given screenshot using OpenCV ORB feature similarity."""
+    if not candidate_paths:
+        return None
+    if len(candidate_paths) == 1:
+        return candidate_paths[0]
+        
+    try:
+        img_ss = cv2.imread(screenshot_path, cv2.IMREAD_GRAYSCALE)
+        if img_ss is None:
+            return candidate_paths[0]
+            
+        h, w = img_ss.shape
+        # Crop central graphic area where the person/subject photo usually is
+        ss_crop = img_ss[int(h * 0.12):int(h * 0.68), :]
+        
+        orb = cv2.ORB_create(nfeatures=1200)
+        kp_ss, des_ss = orb.detectAndCompute(ss_crop, None)
+        if des_ss is None:
+            return candidate_paths[0]
+            
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        best_score = -1
+        best_candidate = candidate_paths[0]
+        
+        for c_path in candidate_paths:
+            img_c = cv2.imread(c_path, cv2.IMREAD_GRAYSCALE)
+            if img_c is None:
+                continue
+            kp_c, des_c = orb.detectAndCompute(img_c, None)
+            if des_c is None:
+                continue
+            matches = bf.match(des_ss, des_c)
+            good_matches = [m for m in matches if m.distance < 60]
+            score = len(good_matches)
+            if score > best_score:
+                best_score = score
+                best_candidate = c_path
+                
+        return best_candidate
+    except Exception as e:
+        logger.warning(f"Error in match_screenshot_to_images: {e}")
+        return candidate_paths[0]
+
 def get_rendered_textbox_keyboard(font_choice: str = "faith") -> InlineKeyboardMarkup:
     """Build the inline keyboard shown after a text box is rendered."""
     font_choice = (font_choice or "faith").lower()
@@ -1923,6 +1967,12 @@ STATE_WAITING_DOGE_HIGHLIGHT_LINES = 9
 STATE_WAITING_CHANGE_MAIN = 10
 STATE_WAITING_CHANGE_SHAPE1 = 11
 STATE_WAITING_CHANGE_SHAPE2 = 12
+
+# No-Dependency Batch Mode States
+STATE_NODEP_COUNTS = 20
+STATE_NODEP_DUMP = 21
+STATE_NODEP_REVIEW = 22
+STATE_NODEP_EDIT_TEXT = 23
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Entry point: Greet user and offer font styles."""
@@ -4796,6 +4846,506 @@ def run_test_renders():
         
     logger.info("Test renders complete! You can view the saved images.")
 
+# ==============================================================================
+# NO-DEPENDENCY BATCH MODE
+# Allows dumping screenshots + clean images in bulk, matching them automatically,
+# assigning Charlie / MAGA styles, and granting full post-render editing power.
+# ==============================================================================
+
+async def nodependency_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for No-Dependency Batch Mode (/nodependency, /batch, /dump)."""
+    restore_session_if_needed(update, context)
+    
+    # Initialize session
+    context.user_data["nodep_session"] = {
+        "count_charlie": 1,
+        "count_maga": 1,
+        "files": [],
+        "screenshots": [],
+        "clean_images": [],
+        "queue": [],
+        "current_idx": 0
+    }
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("1 Charlie, 1 MAGA", callback_data="nodep_cnt:1:1"),
+            InlineKeyboardButton("2 Charlie, 2 MAGA", callback_data="nodep_cnt:2:2")
+        ],
+        [
+            InlineKeyboardButton("3 Charlie, 3 MAGA", callback_data="nodep_cnt:3:3"),
+            InlineKeyboardButton("4 Charlie, 4 MAGA", callback_data="nodep_cnt:4:4")
+        ],
+        [
+            InlineKeyboardButton("🇺🇸 All Charlie (2)", callback_data="nodep_cnt:2:0"),
+            InlineKeyboardButton("🇺🇸 All MAGA (2)", callback_data="nodep_cnt:0:2")
+        ],
+        [
+            InlineKeyboardButton("✏️ Custom Count", callback_data="nodep_cnt:custom")
+        ]
+    ]
+    
+    msg_text = (
+        "🚀 **Welcome to No-Dependency Batch Mode!**\n\n"
+        "Assemble multiple graphics in one go by simply dumping your screenshots and clean photos together!\n\n"
+        "📊 **First, how many graphics would you like to create for each style?**"
+    )
+    
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        
+    return STATE_NODEP_COUNTS
+
+async def nodep_counts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles style quantity selection."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data.split(":")
+    if len(data) >= 3 and data[1] != "custom":
+        charlie_cnt = int(data[1])
+        maga_cnt = int(data[2])
+        sess = context.user_data.setdefault("nodep_session", {})
+        sess["count_charlie"] = charlie_cnt
+        sess["count_maga"] = maga_cnt
+        sess["files"] = []
+        
+        dump_kb = [
+            [InlineKeyboardButton("⚡ Start Assembly (0 files received)", callback_data="nodep_action:start_assembly")],
+            [InlineKeyboardButton("❌ Cancel Batch", callback_data="nodep_action:cancel")]
+        ]
+        
+        await query.message.reply_text(
+            f"✅ **Target Selected:** {charlie_cnt} Charlie, {maga_cnt} MAGA ({charlie_cnt + maga_cnt} total)\n\n"
+            "📥 **Now DUMP all your files together in this chat!**\n\n"
+            "Send as many as you have:\n"
+            "• 📸 **Screenshots** (with text/headlines to OCR)\n"
+            "• 👤 **Clean Photos** (portraits, subjects, backgrounds)\n\n"
+            "Send them all now! When you finish, tap **Start Assembly** below.",
+            reply_markup=InlineKeyboardMarkup(dump_kb),
+            parse_mode="Markdown"
+        )
+        return STATE_NODEP_DUMP
+        
+    elif data[1] == "custom":
+        await query.message.reply_text(
+            "💬 **Please reply with your desired counts** (e.g. `2 Charlie 3 MAGA` or just `2 3`):"
+        )
+        return STATE_NODEP_COUNTS
+
+async def nodep_custom_counts_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Parses custom text counts from user."""
+    text = update.message.text.strip()
+    nums = [int(n) for n in re.findall(r'\d+', text)]
+    if len(nums) >= 2:
+        charlie_cnt, maga_cnt = nums[0], nums[1]
+    elif len(nums) == 1:
+        charlie_cnt, maga_cnt = nums[0], nums[0]
+    else:
+        charlie_cnt, maga_cnt = 1, 1
+        
+    sess = context.user_data.setdefault("nodep_session", {})
+    sess["count_charlie"] = charlie_cnt
+    sess["count_maga"] = maga_cnt
+    sess["files"] = []
+    
+    dump_kb = [
+        [InlineKeyboardButton("⚡ Start Assembly (0 files received)", callback_data="nodep_action:start_assembly")],
+        [InlineKeyboardButton("❌ Cancel Batch", callback_data="nodep_action:cancel")]
+    ]
+    
+    await update.message.reply_text(
+        f"✅ **Target Set:** {charlie_cnt} Charlie, {maga_cnt} MAGA ({charlie_cnt + maga_cnt} total)\n\n"
+        "📥 **Dump all your screenshots and clean photos now!**\n"
+        "When finished uploading, tap **Start Assembly** below.",
+        reply_markup=InlineKeyboardMarkup(dump_kb),
+        parse_mode="Markdown"
+    )
+    return STATE_NODEP_DUMP
+
+async def nodep_file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Collects dumped media files in No-Dependency mode."""
+    user_id = update.effective_user.id
+    sess = context.user_data.setdefault("nodep_session", {"files": [], "count_charlie": 1, "count_maga": 1})
+    files = sess.setdefault("files", [])
+    
+    photo_file = None
+    if update.message.photo:
+        photo_file = await update.message.photo[-1].get_file()
+    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
+        photo_file = await update.message.document.get_file()
+        
+    if not photo_file:
+        return STATE_NODEP_DUMP
+        
+    save_dir = os.path.join(BASE_DIR, "scratch", f"nodep_{user_id}")
+    os.makedirs(save_dir, exist_ok=True)
+    file_path = os.path.join(save_dir, f"file_{len(files) + 1}.jpg")
+    await photo_file.download_to_drive(file_path)
+    files.append(file_path)
+    
+    # Send quick confirmation with updated count
+    count = len(files)
+    dump_kb = [
+        [InlineKeyboardButton(f"⚡ Start Assembly ({count} files received)", callback_data="nodep_action:start_assembly")],
+        [InlineKeyboardButton("❌ Cancel Batch", callback_data="nodep_action:cancel")]
+    ]
+    await update.message.reply_text(
+        f"📥 **File #{count} received!** Keep sending more files, or click Start Assembly when finished.",
+        reply_markup=InlineKeyboardMarkup(dump_kb),
+        parse_mode="Markdown"
+    )
+    return STATE_NODEP_DUMP
+
+async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Analyzes dumped files, pairs screenshots to clean photos, and builds the graphics."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+    target_msg = query.message if query else update.message
+    
+    sess = context.user_data.get("nodep_session", {})
+    files = sess.get("files", [])
+    
+    if not files:
+        await target_msg.reply_text("⚠️ No files received yet. Please send some screenshots and clean photos first!")
+        return STATE_NODEP_DUMP
+        
+    status_msg = await target_msg.reply_text(f"⚙️ Analyzing {len(files)} uploaded files... (Running OCR & photo separation)")
+    
+    try:
+        screenshots = []
+        clean_images = []
+        
+        # 1. Classify files into screenshots vs clean portraits
+        for f_path in files:
+            with open(f_path, "rb") as f:
+                img_bytes = f.read()
+            raw_ocr = await asyncio.to_thread(call_ocr_space, img_bytes)
+            headline = await asyncio.to_thread(clean_ocr_headline_with_ai, raw_ocr)
+            
+            if headline and len(headline.strip()) >= 15:
+                screenshots.append({"path": f_path, "headline": headline})
+            else:
+                clean_images.append(f_path)
+                
+        logger.info(f"No-Dep Dump classified: {len(screenshots)} screenshots, {len(clean_images)} clean photos")
+        
+        if not screenshots:
+            await safe_edit_status_message(
+                status_msg,
+                "🤔 Couldn't detect headlines in any of the dumped files.\n"
+                "Please make sure to include at least one screenshot containing text!"
+            )
+            return STATE_NODEP_DUMP
+            
+        # Fallback: if no clean images, use screenshots themselves as backgrounds
+        if not clean_images:
+            clean_images = [s["path"] for s in screenshots]
+            
+        # 2. Build the Generation Queue
+        charlie_target = sess.get("count_charlie", 1)
+        maga_target = sess.get("count_maga", 1)
+        total_target = max(1, charlie_target + maga_target)
+        
+        style_list = (["charlie"] * charlie_target) + (["maga"] * maga_target)
+        if not style_list:
+            style_list = ["charlie"]
+            
+        charlie_colors = ["yellow", "red", "orange", "magenta", "green", "blue", "purple"]
+        maga_colors = ["yellow", "red", "orange", "magenta", "green", "blue", "purple"]
+        
+        queue = []
+        remaining_clean = list(clean_images)
+        
+        for idx in range(min(total_target, len(screenshots))):
+            ss_item = screenshots[idx % len(screenshots)]
+            ss_path = ss_item["path"]
+            headline = ss_item["headline"]
+            
+            # Match screenshot to best clean photo
+            matched_bg = match_screenshot_to_images(ss_path, remaining_clean if remaining_clean else clean_images)
+            if matched_bg in remaining_clean and len(remaining_clean) > 1:
+                remaining_clean.remove(matched_bg)
+                
+            style = style_list[idx % len(style_list)]
+            color = charlie_colors[idx % len(charlie_colors)] if style == "charlie" else maga_colors[idx % len(maga_colors)]
+            
+            queue.append({
+                "style": style,
+                "color": color,
+                "headline": headline,
+                "bg_path": matched_bg,
+                "clean_candidates": list(clean_images),
+                "rendered_bytes": None
+            })
+            
+        sess["queue"] = queue
+        sess["current_idx"] = 0
+        sess["clean_images"] = clean_images
+        sess["screenshots"] = screenshots
+        
+        await safe_delete_message(status_msg)
+        return await nodep_render_and_display_current(target_msg, context)
+        
+    except Exception as e:
+        logger.error(f"Error in nodep_start_assembly: {e}")
+        await safe_edit_status_message(status_msg, f"❌ Error during assembly: {str(e)}")
+        return STATE_NODEP_DUMP
+
+async def nodep_render_and_display_current(target_msg, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Renders the current post in the queue and presents full No-Dependency controls."""
+    sess = context.user_data.get("nodep_session", {})
+    queue = sess.get("queue", [])
+    idx = sess.get("current_idx", 0)
+    
+    if idx >= len(queue):
+        # All done!
+        await target_msg.reply_text(
+            f"🎉 **Batch Complete!** All {len(queue)} graphics have been assembled and approved.\n\n"
+            "Send /nodependency to start another batch, or send text anytime for single graphics!"
+        )
+        return STATE_WAITING_TEXT
+        
+    post = queue[idx]
+    style = post["style"]
+    color = post["color"]
+    headline = post["headline"]
+    bg_path = post["bg_path"]
+    
+    status = await target_msg.reply_text(f"🎨 Rendering Post {idx + 1}/{len(queue)} ({style.upper()} - {color.capitalize()})...")
+    
+    try:
+        # 1. Render transparent text box
+        image_buffer, line_bottom = await asyncio.to_thread(
+            generate_textbox_image,
+            headline, style, color
+        )
+        png_bytes = image_buffer.getvalue()
+        
+        highlight_color = FREEDOM_WATERMARK_LINE_COLOR if style == "freedom" else get_highlight_color(color)
+        shape_type = "square" if style == "maga" else "circle"
+        
+        # 2. Composite over matched background
+        composite_buffer = await asyncio.to_thread(
+            overlay_png_on_image,
+            bg_path, png_bytes,
+            shape_image_path=None,
+            shape_type=shape_type,
+            border_color=highlight_color,
+            shape_offset_x=0,
+            shape_offset_y=0,
+            shape_scale=1.0,
+            simple_overlay=True,
+            line_bottom=line_bottom
+        )
+        rendered_bytes = composite_buffer.getvalue()
+        post["rendered_bytes"] = rendered_bytes
+        post["line_bottom"] = line_bottom
+        
+        # Save active session references for 3D positioning interoperability
+        context.user_data["transparent_png_bytes"] = png_bytes
+        context.user_data["last_rendered_image_bytes"] = rendered_bytes
+        context.user_data["temp_bg_path"] = bg_path
+        context.user_data["last_text"] = headline
+        context.user_data["chosen_font"] = style
+        context.user_data["chosen_color"] = color
+        context.user_data["line_bottom"] = line_bottom
+        
+        await safe_delete_message(status)
+        
+        # "No Dependency" Control Keyboard
+        keyboard = [
+            [
+                InlineKeyboardButton("✏️ Edit Text", callback_data="nodep_act:edit_text"),
+                InlineKeyboardButton("🔄 Swap Image", callback_data="nodep_act:swap_image")
+            ],
+            [
+                InlineKeyboardButton("🎨 Change Color", callback_data="nodep_act:change_color"),
+                InlineKeyboardButton(f"🔄 Switch Style ({('MAGA' if style == 'charlie' else 'Charlie')})", callback_data="nodep_act:toggle_style")
+            ],
+            [
+                InlineKeyboardButton("🎮 Adjust Position / 3D Pop-Out", callback_data="nodep_act:position_3d")
+            ],
+            [
+                InlineKeyboardButton(f"✅ Next Post ({idx + 1}/{len(queue)}) ➡️", callback_data="nodep_act:next"),
+                InlineKeyboardButton("💾 Finish Batch", callback_data="nodep_act:finish")
+            ]
+        ]
+        
+        caption_text = (
+            f"✨ **Post {idx + 1}/{len(queue)} Assembled!**\n"
+            f"• Style: **{style.upper()}** | Color: **{color.capitalize()}**\n\n"
+            f"📝 **Headline:**\n`{headline}`\n\n"
+            "Use the controls below to change *anything* on this post, or tap Next!"
+        )
+        
+        await target_msg.reply_photo(
+            photo=rendered_bytes,
+            caption=caption_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return STATE_NODEP_REVIEW
+        
+    except Exception as e:
+        logger.error(f"Error rendering post in nodep: {e}")
+        await safe_edit_status_message(status, f"❌ Failed to render post {idx + 1}: {str(e)}")
+        return STATE_NODEP_REVIEW
+
+async def nodep_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles independent post-render actions in No-Dependency mode."""
+    query = update.callback_query
+    await query.answer()
+    
+    action = query.data.split(":")[1]
+    sess = context.user_data.get("nodep_session", {})
+    queue = sess.get("queue", [])
+    idx = sess.get("current_idx", 0)
+    
+    if idx >= len(queue):
+        await query.message.reply_text("Batch finished! Send /nodependency to start another.")
+        return STATE_WAITING_TEXT
+        
+    post = queue[idx]
+    
+    if action == "edit_text":
+        await query.message.reply_text(
+            "✏️ **Tap the text box below to copy it, make your changes, and reply with the new text:**\n\n"
+            f"`{post['headline']}`",
+            parse_mode="Markdown"
+        )
+        return STATE_NODEP_EDIT_TEXT
+        
+    elif action == "swap_image":
+        clean_images = sess.get("clean_images", [])
+        if not clean_images:
+            await query.message.reply_text("⚠️ No alternative clean images found in this dump. You can send a new photo directly to use as background!")
+            return STATE_NODEP_REVIEW
+            
+        swap_kb = []
+        for i, c_path in enumerate(clean_images):
+            swap_kb.append([InlineKeyboardButton(f"🖼️ Use Image #{i + 1}", callback_data=f"nodep_setimg:{i}")])
+        swap_kb.append([InlineKeyboardButton("🔙 Back to Review", callback_data="nodep_act:back")])
+        
+        await query.message.reply_text(
+            f"🔄 **Choose a replacement image for Post {idx + 1}:**",
+            reply_markup=InlineKeyboardMarkup(swap_kb)
+        )
+        return STATE_NODEP_REVIEW
+        
+    elif action == "change_color":
+        palette_kb = [
+            [InlineKeyboardButton("🟡 Yellow", callback_data="nodep_setclr:yellow"), InlineKeyboardButton("🔴 Red", callback_data="nodep_setclr:red")],
+            [InlineKeyboardButton("🟠 Orange", callback_data="nodep_setclr:orange"), InlineKeyboardButton("🟣 Magenta", callback_data="nodep_setclr:magenta")],
+            [InlineKeyboardButton("🟢 Green", callback_data="nodep_setclr:green"), InlineKeyboardButton("🔵 Blue", callback_data="nodep_setclr:blue")],
+            [InlineKeyboardButton("🟪 Purple", callback_data="nodep_setclr:purple")],
+            [InlineKeyboardButton("🔙 Back", callback_data="nodep_act:back")]
+        ]
+        await query.message.reply_text("🎨 **Pick a highlight color for this post:**", reply_markup=InlineKeyboardMarkup(palette_kb))
+        return STATE_NODEP_REVIEW
+        
+    elif action == "toggle_style":
+        post["style"] = "maga" if post["style"] == "charlie" else "charlie"
+        return await nodep_render_and_display_current(query.message, context)
+        
+    elif action == "position_3d":
+        # Launch standard 3D interactive controls for this post
+        shape_type = "square" if post["style"] == "maga" else "circle"
+        highlight_color = get_highlight_color(post["color"])
+        
+        combined_buffer = await asyncio.to_thread(
+            overlay_png_on_image,
+            post["bg_path"], context.user_data["transparent_png_bytes"],
+            shape_image_path=None,
+            shape_type=shape_type,
+            border_color=highlight_color,
+            shape_offset_x=0, shape_offset_y=0, shape_scale=1.0,
+            simple_overlay=True,
+            line_bottom=post.get("line_bottom")
+        )
+        await query.message.reply_photo(
+            photo=combined_buffer,
+            caption=(
+                "🎮 **3D Pop-Out & Positioning:**\n\n"
+                f"Send a **shape image** to place in the **{shape_type}** shape behind the subject for a 3D pop-out layout,\n"
+                "Or use the controls below to position!"
+            ),
+            reply_markup=shape_position_keyboard(move_step=25, scale_step=0.1, active_shape=1, has_second_shape=False)
+        )
+        return STATE_POSITIONING_SHAPE
+        
+    elif action == "next":
+        sess["current_idx"] += 1
+        return await nodep_render_and_display_current(query.message, context)
+        
+    elif action == "finish":
+        await query.message.reply_text(
+            f"💾 **Batch Saved!** All approved graphics have been generated.\n\n"
+            "Ready for more content? Send /nodependency or send text directly!"
+        )
+        return STATE_WAITING_TEXT
+        
+    elif action == "back":
+        return await nodep_render_and_display_current(query.message, context)
+        
+    elif action == "cancel":
+        await query.message.reply_text("❌ Batch cancelled. You are in standard single-post mode.")
+        return STATE_WAITING_TEXT
+        
+    return STATE_NODEP_REVIEW
+
+async def nodep_set_image_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Swaps the background image to the user's selected dump candidate."""
+    query = update.callback_query
+    await query.answer()
+    
+    img_idx = int(query.data.split(":")[1])
+    sess = context.user_data.get("nodep_session", {})
+    clean_images = sess.get("clean_images", [])
+    queue = sess.get("queue", [])
+    curr_idx = sess.get("current_idx", 0)
+    
+    if curr_idx < len(queue) and 0 <= img_idx < len(clean_images):
+        queue[curr_idx]["bg_path"] = clean_images[img_idx]
+        await query.message.reply_text(f"✅ Swapped to Image #{img_idx + 1}!")
+        return await nodep_render_and_display_current(query.message, context)
+        
+    return STATE_NODEP_REVIEW
+
+async def nodep_set_color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Changes color for current batch post."""
+    query = update.callback_query
+    await query.answer()
+    
+    new_color = query.data.split(":")[1]
+    sess = context.user_data.get("nodep_session", {})
+    queue = sess.get("queue", [])
+    curr_idx = sess.get("current_idx", 0)
+    
+    if curr_idx < len(queue):
+        queue[curr_idx]["color"] = new_color
+        return await nodep_render_and_display_current(query.message, context)
+        
+    return STATE_NODEP_REVIEW
+
+async def nodep_edited_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles text input when user edits text on a batch post."""
+    new_text = update.message.text.strip()
+    sess = context.user_data.get("nodep_session", {})
+    queue = sess.get("queue", [])
+    curr_idx = sess.get("current_idx", 0)
+    
+    if curr_idx < len(queue):
+        queue[curr_idx]["headline"] = new_text
+        await update.message.reply_text("✅ Headline updated!")
+        return await nodep_render_and_display_current(update.message, context)
+        
+    return STATE_NODEP_REVIEW
+
 def main():
     parser = argparse.ArgumentParser(description="TextBox Telegram Bot")
     parser.add_argument("--test-render", action="store_true", help="Generate test rendering images and exit")
@@ -4857,6 +5407,9 @@ def main():
             CommandHandler("clear_image", clear_image),
             CommandHandler("ocr", ocr_command),
             CommandHandler("findimages", ai_find_images_command),
+            CommandHandler("nodependency", nodependency_command),
+            CommandHandler("batch", nodependency_command),
+            CommandHandler("dump", nodependency_command),
             MessageHandler(filters.TEXT & ~filters.COMMAND, text_received),
             MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_received)
         ],
@@ -4873,6 +5426,9 @@ def main():
                 CommandHandler("clear_image", clear_image),
                 CommandHandler("ocr", ocr_command),
                 CommandHandler("findimages", ai_find_images_command),
+                CommandHandler("nodependency", nodependency_command),
+                CommandHandler("batch", nodependency_command),
+                CommandHandler("dump", nodependency_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_received),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_received),
                 CallbackQueryHandler(change_color, pattern="^recolor:"),
@@ -4888,6 +5444,9 @@ def main():
                 CommandHandler("done", skip_background),
                 CommandHandler("ocr", ocr_command),
                 CommandHandler("findimages", ai_find_images_command),
+                CommandHandler("nodependency", nodependency_command),
+                CommandHandler("batch", nodependency_command),
+                CommandHandler("dump", nodependency_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex("^(?:/skip|/done|Done|done|Skip)$"), skip_background),
                 CallbackQueryHandler(skip_background, pattern="^bg_done$"),
                 MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, background_received),
@@ -4949,9 +5508,35 @@ def main():
             STATE_WAITING_CHANGE_SHAPE2: [
                 MessageHandler(filters.PHOTO, change_shape2_image_received),
                 CallbackQueryHandler(cancel_change_callback, pattern="^cancel_change$"),
+            ],
+            STATE_NODEP_COUNTS: [
+                CallbackQueryHandler(nodep_counts_callback, pattern="^nodep_cnt:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, nodep_custom_counts_text),
+            ],
+            STATE_NODEP_DUMP: [
+                CallbackQueryHandler(nodep_start_assembly, pattern="^nodep_action:start_assembly$"),
+                CallbackQueryHandler(nodep_review_callback, pattern="^nodep_action:cancel$"),
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, nodep_file_received),
+                CommandHandler("assemble", nodep_start_assembly),
+            ],
+            STATE_NODEP_REVIEW: [
+                CallbackQueryHandler(nodep_review_callback, pattern="^nodep_act:"),
+                CallbackQueryHandler(nodep_set_image_callback, pattern="^nodep_setimg:"),
+                CallbackQueryHandler(nodep_set_color_callback, pattern="^nodep_setclr:"),
+            ],
+            STATE_NODEP_EDIT_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, nodep_edited_text_received),
             ]
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("restart", restart), CommandHandler("ocr", ocr_command), CommandHandler("findimages", ai_find_images_command)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("restart", restart),
+            CommandHandler("ocr", ocr_command),
+            CommandHandler("findimages", ai_find_images_command),
+            CommandHandler("nodependency", nodependency_command),
+            CommandHandler("batch", nodependency_command),
+            CommandHandler("dump", nodependency_command),
+        ],
         per_message=False,
     )
     
