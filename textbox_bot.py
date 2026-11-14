@@ -98,6 +98,7 @@ import argparse
 import asyncio
 import base64
 import re
+import uuid
 from io import BytesIO
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
@@ -4852,9 +4853,23 @@ def run_test_renders():
 # assigning Charlie / MAGA styles, and granting full post-render editing power.
 # ==============================================================================
 
+_nodep_download_lock = asyncio.Lock()
+
+def _clean_nodep_directory(user_id: int):
+    """Safely cleans previous batch dump files for user."""
+    save_dir = os.path.join(BASE_DIR, "scratch", f"nodep_{user_id}")
+    if os.path.exists(save_dir):
+        for f in os.listdir(save_dir):
+            try:
+                os.remove(os.path.join(save_dir, f))
+            except Exception:
+                pass
+
 async def nodependency_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Entry point for No-Dependency Batch Mode (/nodependency, /batch, /dump)."""
     restore_session_if_needed(update, context)
+    user_id = update.effective_user.id
+    _clean_nodep_directory(user_id)
     
     # Initialize session
     context.user_data["nodep_session"] = {
@@ -4864,7 +4879,8 @@ async def nodependency_command(update: Update, context: ContextTypes.DEFAULT_TYP
         "screenshots": [],
         "clean_images": [],
         "queue": [],
-        "current_idx": 0
+        "current_idx": 0,
+        "last_dump_msg": None
     }
     
     keyboard = [
@@ -4903,15 +4919,19 @@ async def nodep_counts_callback(update: Update, context: ContextTypes.DEFAULT_TY
     """Handles style quantity selection."""
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
     
     data = query.data.split(":")
     if len(data) >= 3 and data[1] != "custom":
         charlie_cnt = int(data[1])
         maga_cnt = int(data[2])
+        _clean_nodep_directory(user_id)
+        
         sess = context.user_data.setdefault("nodep_session", {})
         sess["count_charlie"] = charlie_cnt
         sess["count_maga"] = maga_cnt
         sess["files"] = []
+        sess["last_dump_msg"] = None
         
         dump_kb = [
             [InlineKeyboardButton("⚡ Start Assembly (0 files received)", callback_data="nodep_action:start_assembly")],
@@ -4939,6 +4959,7 @@ async def nodep_counts_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def nodep_custom_counts_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Parses custom text counts from user."""
     text = update.message.text.strip()
+    user_id = update.effective_user.id
     nums = [int(n) for n in re.findall(r'\d+', text)]
     if len(nums) >= 2:
         charlie_cnt, maga_cnt = nums[0], nums[1]
@@ -4947,10 +4968,12 @@ async def nodep_custom_counts_text(update: Update, context: ContextTypes.DEFAULT
     else:
         charlie_cnt, maga_cnt = 1, 1
         
+    _clean_nodep_directory(user_id)
     sess = context.user_data.setdefault("nodep_session", {})
     sess["count_charlie"] = charlie_cnt
     sess["count_maga"] = maga_cnt
     sess["files"] = []
+    sess["last_dump_msg"] = None
     
     dump_kb = [
         [InlineKeyboardButton("⚡ Start Assembly (0 files received)", callback_data="nodep_action:start_assembly")],
@@ -4967,10 +4990,9 @@ async def nodep_custom_counts_text(update: Update, context: ContextTypes.DEFAULT
     return STATE_NODEP_DUMP
 
 async def nodep_file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Collects dumped media files in No-Dependency mode."""
+    """Collects dumped media files in No-Dependency mode with concurrency safety."""
     user_id = update.effective_user.id
     sess = context.user_data.setdefault("nodep_session", {"files": [], "count_charlie": 1, "count_maga": 1})
-    files = sess.setdefault("files", [])
     
     photo_file = None
     if update.message.photo:
@@ -4983,21 +5005,37 @@ async def nodep_file_received(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     save_dir = os.path.join(BASE_DIR, "scratch", f"nodep_{user_id}")
     os.makedirs(save_dir, exist_ok=True)
-    file_path = os.path.join(save_dir, f"file_{len(files) + 1}.jpg")
-    await photo_file.download_to_drive(file_path)
-    files.append(file_path)
     
-    # Send quick confirmation with updated count
-    count = len(files)
+    # Generate collision-free filename with UUID and millisecond timestamp
+    unique_name = f"dump_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.jpg"
+    file_path = os.path.join(save_dir, unique_name)
+    await photo_file.download_to_drive(file_path)
+    
+    async with _nodep_download_lock:
+        file_list = sess.setdefault("files", [])
+        if file_path not in file_list:
+            file_list.append(file_path)
+        count = len(file_list)
+        
     dump_kb = [
         [InlineKeyboardButton(f"⚡ Start Assembly ({count} files received)", callback_data="nodep_action:start_assembly")],
         [InlineKeyboardButton("❌ Cancel Batch", callback_data="nodep_action:cancel")]
     ]
-    await update.message.reply_text(
+    
+    # Cleanly remove the prior count prompt if possible to prevent chat flooding
+    prev_msg = sess.get("last_dump_msg")
+    if prev_msg:
+        try:
+            await prev_msg.delete()
+        except Exception:
+            pass
+            
+    sent_msg = await update.message.reply_text(
         f"📥 **File #{count} received!** Keep sending more files, or click Start Assembly when finished.",
         reply_markup=InlineKeyboardMarkup(dump_kb),
         parse_mode="Markdown"
     )
+    sess["last_dump_msg"] = sent_msg
     return STATE_NODEP_DUMP
 
 async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -5008,7 +5046,16 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
     target_msg = query.message if query else update.message
     
     sess = context.user_data.get("nodep_session", {})
-    files = sess.get("files", [])
+    raw_files = sess.get("files", [])
+    
+    # Ensure files exist, are unique, and non-empty
+    seen = set()
+    files = []
+    for f in raw_files:
+        if f not in seen and os.path.exists(f) and os.path.getsize(f) > 1000:
+            seen.add(f)
+            files.append(f)
+    sess["files"] = files
     
     if not files:
         await target_msg.reply_text("⚠️ No files received yet. Please send some screenshots and clean photos first!")
@@ -5042,7 +5089,7 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return STATE_NODEP_DUMP
             
-        # Fallback: if no clean images, use screenshots themselves as backgrounds
+        # Fallback: if no clean images were provided, use screenshots themselves as backgrounds
         if not clean_images:
             clean_images = [s["path"] for s in screenshots]
             
@@ -5051,7 +5098,16 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
         maga_target = sess.get("count_maga", 1)
         total_target = max(1, charlie_target + maga_target)
         
-        style_list = (["charlie"] * charlie_target) + (["maga"] * maga_target)
+        # Interleave styles evenly: Charlie, MAGA, Charlie, MAGA...
+        style_list = []
+        c_left, m_left = charlie_target, maga_target
+        while c_left > 0 or m_left > 0:
+            if c_left > 0:
+                style_list.append("charlie")
+                c_left -= 1
+            if m_left > 0:
+                style_list.append("maga")
+                m_left -= 1
         if not style_list:
             style_list = ["charlie"]
             
@@ -5060,15 +5116,19 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
         
         queue = []
         remaining_clean = list(clean_images)
+        target_count = max(total_target, len(screenshots))
         
-        for idx in range(min(total_target, len(screenshots))):
+        for idx in range(target_count):
             ss_item = screenshots[idx % len(screenshots)]
             ss_path = ss_item["path"]
             headline = ss_item["headline"]
             
-            # Match screenshot to best clean photo
-            matched_bg = match_screenshot_to_images(ss_path, remaining_clean if remaining_clean else clean_images)
-            if matched_bg in remaining_clean and len(remaining_clean) > 1:
+            # Match screenshot to best clean photo from available clean images
+            if not remaining_clean:
+                remaining_clean = list(clean_images)
+                
+            matched_bg = match_screenshot_to_images(ss_path, remaining_clean)
+            if matched_bg in remaining_clean:
                 remaining_clean.remove(matched_bg)
                 
             style = style_list[idx % len(style_list)]
@@ -5232,7 +5292,7 @@ async def nodep_review_callback(update: Update, context: ContextTypes.DEFAULT_TY
         swap_kb.append([InlineKeyboardButton("🔙 Back to Review", callback_data="nodep_act:back")])
         
         await query.message.reply_text(
-            f"🔄 **Choose a replacement image for Post {idx + 1}:**",
+            f"🔄 **Choose a replacement image for Post {idx + 1}:**\n(Or send any new photo directly to replace it)",
             reply_markup=InlineKeyboardMarkup(swap_kb)
         )
         return STATE_NODEP_REVIEW
@@ -5295,6 +5355,37 @@ async def nodep_review_callback(update: Update, context: ContextTypes.DEFAULT_TY
     elif action == "cancel":
         await query.message.reply_text("❌ Batch cancelled. You are in standard single-post mode.")
         return STATE_WAITING_TEXT
+        
+    return STATE_NODEP_REVIEW
+
+async def nodep_review_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """If user drops a photo while reviewing a batch post, replace the background and re-render."""
+    user_id = update.effective_user.id
+    photo_file = None
+    if update.message.photo:
+        photo_file = await update.message.photo[-1].get_file()
+    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
+        photo_file = await update.message.document.get_file()
+        
+    if not photo_file:
+        return STATE_NODEP_REVIEW
+        
+    save_dir = os.path.join(BASE_DIR, "scratch", f"nodep_{user_id}")
+    os.makedirs(save_dir, exist_ok=True)
+    new_bg = os.path.join(save_dir, f"custom_bg_{int(time.time() * 1000)}_{uuid.uuid4().hex[:4]}.jpg")
+    await photo_file.download_to_drive(new_bg)
+    
+    sess = context.user_data.get("nodep_session", {})
+    queue = sess.get("queue", [])
+    curr_idx = sess.get("current_idx", 0)
+    
+    if curr_idx < len(queue):
+        queue[curr_idx]["bg_path"] = new_bg
+        clean_images = sess.setdefault("clean_images", [])
+        if new_bg not in clean_images:
+            clean_images.append(new_bg)
+        await update.message.reply_text("✅ Background photo updated for this post!")
+        return await nodep_render_and_display_current(update.message, context)
         
     return STATE_NODEP_REVIEW
 
@@ -5523,6 +5614,7 @@ def main():
                 CallbackQueryHandler(nodep_review_callback, pattern="^nodep_act:"),
                 CallbackQueryHandler(nodep_set_image_callback, pattern="^nodep_setimg:"),
                 CallbackQueryHandler(nodep_set_color_callback, pattern="^nodep_setclr:"),
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, nodep_review_photo_received),
             ],
             STATE_NODEP_EDIT_TEXT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, nodep_edited_text_received),
