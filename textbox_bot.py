@@ -891,6 +891,95 @@ CRITICAL RULES:
             continue
     return ""
 
+def find_ai_post_subjects(headline: str) -> dict:
+    """Uses AI to identify the primary subject and related thematic elements for a headline."""
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key or not headline:
+        return {}
+    
+    system_prompt = "You are an AI assistant for a graphic designer creating news/political social media posters. Suggest precise image search terms for subjects."
+    user_prompt = f"""Given this headline:
+\"{headline}\"
+
+Suggest search terms to find high-resolution photos for:
+1. "main": The primary person, leader, or subject mentioned (e.g. "Marco Rubio", "Donald Trump", "JD Vance").
+2. "shape1": A related government monument, landmark, or symbol (e.g. "United States Capitol", "White House", "American Flag").
+3. "shape2": A secondary related figure or official venue (e.g. "Oval Office", "Donald Trump").
+
+Return ONLY a JSON object:
+{{"main": "...", "shape1": "...", "shape2": "..."}}"""
+
+    models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+    for m in models:
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                json={
+                    "model": m,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.1
+                },
+                timeout=10
+            )
+            if r.status_code == 200:
+                raw_json = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                if raw_json.startswith("```"):
+                    raw_json = re.sub(r"^```[a-z]*\n?", "", raw_json)
+                    raw_json = re.sub(r"\n?```$", "", raw_json)
+                data = json.loads(raw_json)
+                if isinstance(data, dict) and "main" in data:
+                    return data
+        except Exception as e:
+            logger.warning(f"Error extracting subjects with model {m}: {e}")
+            continue
+    return {}
+
+def search_wikimedia_image(query: str) -> str:
+    """Searches Wikipedia and Wikimedia Commons for high-resolution images."""
+    if not query:
+        return None
+    headers = {"User-Agent": "TemplateaBot/1.0 (contact@templatea.com)"}
+    
+    clean_q = re.sub(r"(?i)\b(portrait|photo|picture|building|interior|seal|flag|high resolution|official|hd|4k)\b", "", query).strip()
+    clean_q = re.sub(r"\s+", " ", clean_q).strip()
+
+    # 1. Wikipedia Pageimage (best for specific public figures)
+    try:
+        url = f"https://en.wikipedia.org/w/api.php?action=query&titles={requests.utils.quote(clean_q)}&prop=pageimages&format=json&pithumbsize=1280"
+        r = requests.get(url, headers=headers, timeout=6)
+        if r.status_code == 200:
+            pages = r.json().get("query", {}).get("pages", {})
+            for pid, pdata in pages.items():
+                if pid != "-1":
+                    thumb = pdata.get("thumbnail", {}).get("source")
+                    if thumb and not any(bad in thumb.lower() for bad in [".pdf", ".djvu", ".tif", ".svg"]):
+                        return thumb
+    except Exception:
+        pass
+        
+    # 2. Wikimedia Commons Generator Search
+    try:
+        url = f"https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch={requests.utils.quote(clean_q)}&gsrlimit=6&prop=imageinfo&iiprop=url|size&iiurlwidth=1280&format=json"
+        r = requests.get(url, headers=headers, timeout=6)
+        if r.status_code == 200:
+            pages = r.json().get("query", {}).get("pages", {})
+            for pid, pdata in pages.items():
+                title = pdata.get("title", "")
+                if any(bad in title.lower() for bad in [".pdf", ".djvu", ".tif", ".svg", "bulletin", "map", "document"]):
+                    continue
+                ii = pdata.get("imageinfo", [{}])[0]
+                thumb = ii.get("thumburl")
+                if thumb and not any(bad in thumb.lower() for bad in [".pdf", ".djvu", ".tif", ".svg"]):
+                    return thumb
+    except Exception:
+        pass
+        
+    return None
+
 def get_rendered_textbox_keyboard(font_choice: str = "faith") -> InlineKeyboardMarkup:
     """Build the inline keyboard shown after a text box is rendered."""
     font_choice = (font_choice or "faith").lower()
@@ -2029,20 +2118,17 @@ async def color_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             await safe_delete_message(status_msg)
             
-            if font_choice in ("charlie", "maga", "maga_charlie"):
-                bg_keyboard = [[InlineKeyboardButton("✅ Done", callback_data="bg_done")]]
-                await query.message.reply_text(
-                    "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                    "📥 **Send an image or a video now** to blend it,\n"
-                    "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
-                    reply_markup=InlineKeyboardMarkup(bg_keyboard)
-                )
-            else:
-                await query.message.reply_text(
-                    "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                    "📥 **Send an image or a video now** to blend it,\n"
-                    "➡️ Or send new text to create another one."
-                )
+            bg_keyboard = [
+                [InlineKeyboardButton("🔍 AI Find Images (Auto)", callback_data="ai_find_images")],
+                [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
+            ]
+            await query.message.reply_text(
+                "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+                "🔍 Click **AI Find Images (Auto)** to automatically find photos for this post,\n"
+                "📥 Or **send your own photo/video now** to use as background,\n"
+                "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
+                reply_markup=InlineKeyboardMarkup(bg_keyboard)
+            )
             return STATE_WAITING_BACKGROUND
         except Exception as e:
             logger.error(f"Error re-rendering in color_selected: {e}")
@@ -2117,22 +2203,17 @@ async def change_color(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             await safe_delete_message(status_msg)
             
             # Re-prompt for background image/video
-            if font_choice in ("charlie", "maga", "maga_charlie"):
-                bg_keyboard = [
-                    [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
-                ]
-                await query.message.reply_text(
-                    "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                    "📥 **Send an image or a video now** to blend it,\n"
-                    "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
-                    reply_markup=InlineKeyboardMarkup(bg_keyboard)
-                )
-            else:
-                await query.message.reply_text(
-                    "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                    "📥 **Send an image or a video now** to blend it,\n"
-                    "➡️ Or click/type /skip to keep the transparent PNG layout and send new text."
-                )
+            bg_keyboard = [
+                [InlineKeyboardButton("🔍 AI Find Images (Auto)", callback_data="ai_find_images")],
+                [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
+            ]
+            await query.message.reply_text(
+                "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+                "🔍 Click **AI Find Images (Auto)** to automatically find photos for this post,\n"
+                "📥 Or **send your own photo/video now** to use as background,\n"
+                "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
+                reply_markup=InlineKeyboardMarkup(bg_keyboard)
+            )
             return STATE_WAITING_BACKGROUND
             
         except Exception as e:
@@ -2302,12 +2383,14 @@ async def image_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await safe_delete_message(render_status)
         
         bg_keyboard = [
-            [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
+            [InlineKeyboardButton("🔍 AI Find Images (Auto)", callback_data="ai_find_images")],
+            [InlineKeyboardButton("✅ Done (Keep Transparent)", callback_data="bg_done")]
         ]
         await update.message.reply_text(
             "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-            "📥 **Send an image or a video now** to blend it,\n"
-            "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
+            "🔍 Click **AI Find Images (Auto)** to automatically find photos for this post,\n"
+            "📥 Or **send your own photo/video now** to use as background,\n"
+            "➡️ Or click **Done** below to keep this transparent layout.",
             reply_markup=InlineKeyboardMarkup(bg_keyboard)
         )
         return STATE_WAITING_BACKGROUND
@@ -2526,22 +2609,17 @@ async def text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 reply_markup=markup,
                 parse_mode="Markdown"
             )
-        if font_choice in ("charlie", "maga", "maga_charlie"):
-            bg_keyboard = [
-                [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
-            ]
-            await update.message.reply_text(
-                "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                "📥 **Send an image or a video now** to blend it,\n"
-                "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
-                reply_markup=InlineKeyboardMarkup(bg_keyboard)
-            )
-        else:
-            await update.message.reply_text(
-                "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                "📥 **Send an image or a video now** to blend it,\n"
-                "➡️ Or click/type /skip to keep the transparent PNG layout and send new text."
-            )
+        bg_keyboard = [
+            [InlineKeyboardButton("🔍 AI Find Images (Auto)", callback_data="ai_find_images")],
+            [InlineKeyboardButton("✅ Done (Keep Transparent)", callback_data="bg_done")]
+        ]
+        await update.message.reply_text(
+            "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
+            "🔍 Click **AI Find Images (Auto)** to automatically find photos for this post,\n"
+            "📥 Or **send your own photo/video now** to use as background,\n"
+            "➡️ Or click **Done** below to keep this transparent layout.",
+            reply_markup=InlineKeyboardMarkup(bg_keyboard)
+        )
         return STATE_WAITING_BACKGROUND
         
     except Exception as e:
@@ -2768,11 +2846,13 @@ async def ig_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             
             # Ask user for background image/video
             bg_keyboard = [
+                [InlineKeyboardButton("🔍 AI Find Images (Auto)", callback_data="ai_find_images")],
                 [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
             ]
             await query.message.reply_text(
                 "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                "📥 **Send an image or a video now** to blend it,\n"
+                "🔍 Click **AI Find Images (Auto)** to automatically find photos for this post,\n"
+                "📥 Or **send your own photo/video now** to use as background,\n"
                 "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
                 reply_markup=InlineKeyboardMarkup(bg_keyboard)
             )
@@ -2824,11 +2904,13 @@ async def ig_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await safe_delete_message(status_msg)
             
             bg_keyboard = [
+                [InlineKeyboardButton("🔍 AI Find Images (Auto)", callback_data="ai_find_images")],
                 [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
             ]
             await update.message.reply_text(
                 "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                "📥 **Send an image or a video now** to blend it,\n"
+                "🔍 Click **AI Find Images (Auto)** to automatically find photos for this post,\n"
+                "📥 Or **send your own photo/video now** to use as background,\n"
                 "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
                 reply_markup=InlineKeyboardMarkup(bg_keyboard)
             )
@@ -2997,11 +3079,13 @@ async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
             # Ask user for background image/video
             bg_keyboard = [
+                [InlineKeyboardButton("🔍 AI Find Images (Auto)", callback_data="ai_find_images")],
                 [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
             ]
             await update.message.reply_text(
                 "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                "📥 **Send an image or a video now** to blend it,\n"
+                "🔍 Click **AI Find Images (Auto)** to automatically find photos for this post,\n"
+                "📥 Or **send your own photo/video now** to use as background,\n"
                 "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
                 reply_markup=InlineKeyboardMarkup(bg_keyboard)
             )
@@ -3053,11 +3137,13 @@ async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await safe_delete_message(status_msg)
             
             bg_keyboard = [
+                [InlineKeyboardButton("🔍 AI Find Images (Auto)", callback_data="ai_find_images")],
                 [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
             ]
             await update.message.reply_text(
                 "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                "📥 **Send an image or a video now** to blend it,\n"
+                "🔍 Click **AI Find Images (Auto)** to automatically find photos for this post,\n"
+                "📥 Or **send your own photo/video now** to use as background,\n"
                 "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
                 reply_markup=InlineKeyboardMarkup(bg_keyboard)
             )
@@ -3177,11 +3263,13 @@ async def color_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Ask user for background image/video
         if font_choice in ("charlie", "maga", "maga_charlie"):
             bg_keyboard = [
+                [InlineKeyboardButton("🔍 AI Find Images (Auto)", callback_data="ai_find_images")],
                 [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
             ]
             await query.message.reply_text(
                 "🖼️ **Would you like to overlay this text box on top of a background image or video?**\n\n"
-                "📥 **Send an image or a video now** to blend it,\n"
+                "🔍 Click **AI Find Images (Auto)** to automatically find photos for this post,\n"
+                "📥 Or **send your own photo/video now** to use as background,\n"
                 "➡️ Or click **Done** below to keep this transparent layout and generate your caption.",
                 reply_markup=InlineKeyboardMarkup(bg_keyboard)
             )
@@ -3445,6 +3533,228 @@ async def skip_background(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await safe_reply_caption(target_msg, caption_text)
         
     return STATE_WAITING_TEXT
+
+async def ai_find_images_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Triggered when user clicks 'AI Find Images'. Finds matching images and displays options."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+    target_msg = query.message if query else update.message
+    
+    headline = context.user_data.get("last_text", "")
+    if not headline:
+        await target_msg.reply_text("❌ No text found. Please send text or a screenshot first.")
+        return STATE_WAITING_TEXT
+        
+    status_msg = await target_msg.reply_text("🔍 AI is identifying subjects & finding high-res photos...")
+    try:
+        # Extract subjects via Groq AI
+        subjects = await asyncio.to_thread(find_ai_post_subjects, headline)
+        main_q = subjects.get("main", "")
+        shape1_q = subjects.get("shape1", "United States Capitol")
+        shape2_q = subjects.get("shape2", "White House")
+        
+        if not main_q:
+            main_q = headline[:30]
+            
+        # Search for images via Wikimedia Commons
+        main_url = await asyncio.to_thread(search_wikimedia_image, main_q)
+        shape1_url = await asyncio.to_thread(search_wikimedia_image, shape1_q) if shape1_q else None
+        shape2_url = await asyncio.to_thread(search_wikimedia_image, shape2_q) if shape2_q else None
+        
+        if not main_url:
+            await safe_edit_status_message(
+                status_msg,
+                f"🤔 Could not find an automatic image for '{main_q}'.\n\n"
+                "Please send your own background photo directly in chat!"
+            )
+            return STATE_WAITING_BACKGROUND
+            
+        context.user_data["ai_found_images"] = {
+            "main_url": main_url,
+            "main_query": main_q,
+            "shape1_url": shape1_url,
+            "shape1_query": shape1_q,
+            "shape2_url": shape2_url,
+            "shape2_query": shape2_q
+        }
+        
+        await safe_delete_message(status_msg)
+        
+        summary_text = (
+            "🎯 **AI Found Matching Images for this Post:**\n\n"
+            f"👤 **Main Subject:** {main_q}\n"
+        )
+        if shape1_q:
+            summary_text += f"🏛️ **Shape 1:** {shape1_q}\n"
+        if shape2_q:
+            summary_text += f"🇺🇸 **Shape 2:** {shape2_q}\n"
+            
+        summary_text += (
+            "\n⚡ Click **Auto-Assemble 3D Graphic** to build the 3D cutout layout instantly,\n"
+            "👤 Or **Use as Main Background Only**,\n"
+            "📥 Or send your own photo/video manually."
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("⚡ Auto-Assemble 3D Graphic", callback_data="ai_assemble:3d")
+            ],
+            [
+                InlineKeyboardButton("👤 Use as Main Background Only", callback_data="ai_assemble:main_only")
+            ],
+            [
+                InlineKeyboardButton("📥 I'll Send My Own Photo", callback_data="ai_cancel")
+            ]
+        ]
+        
+        await target_msg.reply_text(
+            summary_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return STATE_WAITING_BACKGROUND
+        
+    except Exception as e:
+        logger.error(f"Error in ai_find_images: {e}")
+        await safe_edit_status_message(status_msg, f"❌ Error searching images: {str(e)}")
+        return STATE_WAITING_BACKGROUND
+
+async def ai_find_images_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Command alias /findimages to trigger AI image search."""
+    return await ai_find_images_callback(update, context)
+
+async def ai_assemble_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Assembles the graphic using the AI-found images."""
+    query = update.callback_query
+    await query.answer()
+    
+    action = query.data.split(":")[1]  # "3d" or "main_only"
+    user_id = update.effective_user.id
+    
+    ai_images = context.user_data.get("ai_found_images", {})
+    main_url = ai_images.get("main_url")
+    shape1_url = ai_images.get("shape1_url")
+    
+    if not main_url:
+        await query.message.reply_text("❌ Image URLs expired. Please click AI Find Images again.")
+        return STATE_WAITING_BACKGROUND
+        
+    status_msg = await query.message.reply_text("⚙️ Downloading images & rendering 3D composite...")
+    try:
+        headers = {"User-Agent": "TemplateaBot/1.0 (contact@templatea.com)"}
+        bg_path = os.path.join(BASE_DIR, f"user_bg_img_{user_id}.jpg")
+        
+        def download_file(url, path):
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                with open(path, "wb") as f:
+                    f.write(resp.content)
+                return True
+            return False
+            
+        ok_bg = await asyncio.to_thread(download_file, main_url, bg_path)
+        if not ok_bg:
+            await safe_edit_status_message(status_msg, "❌ Failed to download main subject image.")
+            return STATE_WAITING_BACKGROUND
+            
+        context.user_data["temp_bg_path"] = bg_path
+        context.user_data["temp_bg_type"] = "image"
+        
+        png_bytes = context.user_data.get("transparent_png_bytes")
+        font_choice = context.user_data.get("chosen_font", "faith")
+        color_choice = context.user_data.get("chosen_color", "yellow")
+        
+        if font_choice == "freedom":
+            highlight_color = FREEDOM_WATERMARK_LINE_COLOR
+        else:
+            highlight_color = get_highlight_color(color_choice)
+            
+        shape_type = "square" if font_choice == "maga" else "circle"
+        
+        if action == "3d" and shape1_url:
+            shape_path = os.path.join(BASE_DIR, f"user_shape_img_{user_id}.jpg")
+            ok_shape = await asyncio.to_thread(download_file, shape1_url, shape_path)
+            
+            if ok_shape:
+                context.user_data["temp_shape_img_path"] = shape_path
+                context.user_data["active_shape_editing"] = 1
+                context.user_data["shape_offset_x"] = -275
+                context.user_data["shape_offset_y"] = 0
+                context.user_data["shape_scale"] = 1.0
+                context.user_data["shape_move_step"] = 25
+                context.user_data["shape_scale_step"] = 0.1
+                
+                combined_buffer = await asyncio.to_thread(
+                    overlay_png_on_image,
+                    bg_path, png_bytes,
+                    shape_image_path=shape_path,
+                    shape_type=shape_type,
+                    border_color=highlight_color,
+                    shape_offset_x=-275,
+                    shape_offset_y=0,
+                    shape_scale=1.0,
+                    line_bottom=context.user_data.get("line_bottom"),
+                    preview_mode=True
+                )
+                context.user_data["last_rendered_image_bytes"] = combined_buffer.getvalue()
+                
+                await safe_delete_message(status_msg)
+                await query.message.reply_photo(
+                    photo=combined_buffer,
+                    caption=(
+                        "✨ **AI 3D Pop-Out Graphic Assembled!**\n\n"
+                        "🎮 Use the controls below to adjust position or scale, or click **Done** when ready!"
+                    ),
+                    reply_markup=shape_position_keyboard(move_step=25, scale_step=0.1, active_shape=1, has_second_shape=False)
+                )
+                return STATE_POSITIONING_SHAPE
+
+        # Otherwise standard main-only overlay
+        preview_buffer = await asyncio.to_thread(
+            overlay_png_on_image,
+            bg_path, png_bytes,
+            shape_image_path=None,
+            shape_type=shape_type,
+            border_color=highlight_color,
+            shape_offset_x=0,
+            shape_offset_y=0,
+            shape_scale=1.0,
+            simple_overlay=True,
+            line_bottom=context.user_data.get("line_bottom")
+        )
+        context.user_data["last_rendered_image_bytes"] = preview_buffer.getvalue()
+        
+        await safe_delete_message(status_msg)
+        keyboard = [
+            [InlineKeyboardButton("🔄 Change Main Image", callback_data="change:main")],
+            [InlineKeyboardButton("✅ Done", callback_data="bg_done")]
+        ]
+        await query.message.reply_photo(
+            photo=preview_buffer,
+            caption=(
+                "🖼️ **Main background applied!**\n\n"
+                f"👤 Send a **shape image** to place in the **{shape_type}** shape behind the subject for 3D pop-out,\n"
+                "➡️ Or click **Done** to save this layout."
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return STATE_WAITING_SHAPE_IMAGE
+        
+    except Exception as e:
+        logger.error(f"Failed to assemble AI graphic: {e}")
+        await safe_edit_status_message(status_msg, f"❌ Error assembling graphic: {str(e)}")
+        return STATE_WAITING_BACKGROUND
+
+async def ai_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User chose to provide their own images manually."""
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "📥 **Manual Mode:** Send your background photo or video directly in chat whenever you're ready!\n\n"
+        "➡️ Or click /skip to keep the transparent text box."
+    )
+    return STATE_WAITING_BACKGROUND
 
 def shape_position_keyboard(move_step: int = 25, scale_step: float = 0.1, active_shape: int = 1, has_second_shape: bool = False) -> InlineKeyboardMarkup:
     """Returns the inline keyboard for shape position and scale adjustment."""
@@ -4545,6 +4855,7 @@ def main():
             CommandHandler("start", start),
             CommandHandler("clear_image", clear_image),
             CommandHandler("ocr", ocr_command),
+            CommandHandler("findimages", ai_find_images_command),
             MessageHandler(filters.TEXT & ~filters.COMMAND, text_received),
             MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_received)
         ],
@@ -4560,17 +4871,22 @@ def main():
             STATE_WAITING_TEXT: [
                 CommandHandler("clear_image", clear_image),
                 CommandHandler("ocr", ocr_command),
+                CommandHandler("findimages", ai_find_images_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_received),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_received),
                 CallbackQueryHandler(change_color, pattern="^recolor:"),
                 CallbackQueryHandler(change_font, pattern="^changefont$"),
                 CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(proofread_callback, pattern="^proofread:"),
+                CallbackQueryHandler(ai_find_images_callback, pattern="^ai_find_images$"),
+                CallbackQueryHandler(ai_assemble_callback, pattern="^ai_assemble:"),
+                CallbackQueryHandler(ai_cancel_callback, pattern="^ai_cancel$"),
             ],
             STATE_WAITING_BACKGROUND: [
                 CommandHandler("skip", skip_background),
                 CommandHandler("done", skip_background),
                 CommandHandler("ocr", ocr_command),
+                CommandHandler("findimages", ai_find_images_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex("^(?:/skip|/done|Done|done|Skip)$"), skip_background),
                 CallbackQueryHandler(skip_background, pattern="^bg_done$"),
                 MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, background_received),
@@ -4579,12 +4895,16 @@ def main():
                 CallbackQueryHandler(change_font, pattern="^changefont$"),
                 CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(proofread_callback, pattern="^proofread:"),
+                CallbackQueryHandler(ai_find_images_callback, pattern="^ai_find_images$"),
+                CallbackQueryHandler(ai_assemble_callback, pattern="^ai_assemble:"),
+                CallbackQueryHandler(ai_cancel_callback, pattern="^ai_cancel$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_received),
             ],
             STATE_WAITING_SHAPE_IMAGE: [
                 CommandHandler("skip", skip_shape_image),
                 CommandHandler("done", skip_shape_image),
                 CommandHandler("ocr", ocr_command),
+                CommandHandler("findimages", ai_find_images_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex("^(?:/skip|/done|Done|done|Skip)$"), skip_shape_image),
                 CallbackQueryHandler(skip_shape_image, pattern="^bg_done$"),
                 CallbackQueryHandler(start_change_main_from_standard, pattern="^change:main$"),
@@ -4593,6 +4913,9 @@ def main():
                 CallbackQueryHandler(change_font, pattern="^changefont$"),
                 CallbackQueryHandler(edit_text_callback, pattern="^edit_text$"),
                 CallbackQueryHandler(proofread_callback, pattern="^proofread:"),
+                CallbackQueryHandler(ai_find_images_callback, pattern="^ai_find_images$"),
+                CallbackQueryHandler(ai_assemble_callback, pattern="^ai_assemble:"),
+                CallbackQueryHandler(ai_cancel_callback, pattern="^ai_cancel$"),
             ],
             STATE_POSITIONING_SHAPE: [
                 CallbackQueryHandler(shape_position_callback, pattern="^pos:"),
@@ -4627,7 +4950,7 @@ def main():
                 CallbackQueryHandler(cancel_change_callback, pattern="^cancel_change$"),
             ]
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("restart", restart), CommandHandler("ocr", ocr_command)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("restart", restart), CommandHandler("ocr", ocr_command), CommandHandler("findimages", ai_find_images_command)],
         per_message=False,
     )
     
