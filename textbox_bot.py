@@ -104,6 +104,7 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
 import cv2
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 from emoji_helper import (
     has_emojis,
     get_apple_emoji_image,
@@ -815,7 +816,7 @@ async def safe_reply_caption(target_message, caption_text: str):
         logger.error(f"Error sending caption: {e}")
 
 def call_ocr_space(image_bytes: bytes) -> str:
-    """Extract text from image bytes using OCR.space API."""
+    """Extract text from image bytes using OCR.space API with automatic retries."""
     url = "https://api.ocr.space/parse/image"
     api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld")
     payload = {
@@ -827,15 +828,20 @@ def call_ocr_space(image_bytes: bytes) -> str:
         "OCREngine": 2
     }
     files = {"file": ("image.jpg", image_bytes, "image/jpeg")}
-    try:
-        response = requests.post(url, files=files, data=payload, timeout=25)
-        if response.status_code == 200:
-            res_json = response.json()
-            results = res_json.get("ParsedResults")
-            if results:
-                return results[0].get("ParsedText", "").strip()
-    except Exception as e:
-        logger.error(f"OCR.space request failed: {e}")
+    for attempt in range(3):
+        try:
+            response = requests.post(url, files=files, data=payload, timeout=25)
+            if response.status_code == 200:
+                res_json = response.json()
+                results = res_json.get("ParsedResults")
+                if results:
+                    text = results[0].get("ParsedText", "").strip()
+                    if text:
+                        return text
+            logger.warning(f"OCR.space attempt {attempt + 1} status code {response.status_code}")
+        except Exception as e:
+            logger.warning(f"OCR.space attempt {attempt + 1} failed: {e}")
+        time.sleep(1.5)
     return ""
 
 def clean_ocr_headline_with_ai(raw_text: str) -> str:
@@ -863,7 +869,7 @@ CRITICAL RULES:
 7. If there is NO headline or quote in the text (e.g. only UI buttons or numbers), return NONE.
 8. Return ONLY the verbatim headline text. No explanations, no quotes."""
 
-    models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+    models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
     if os.getenv("GROQ_MODEL"):
         models.insert(0, os.getenv("GROQ_MODEL"))
     seen = set()
@@ -982,76 +988,69 @@ def search_wikimedia_image(query: str) -> str:
         
     return None
 
-def _phash(img_gray_resized) -> int:
-    """Compute a 64-bit perceptual hash (dHash) for a grayscale image already resized to 9x8."""
-    rows, cols = img_gray_resized.shape
-    bits = []
-    for r in range(rows):
-        for c in range(cols - 1):
-            bits.append(1 if img_gray_resized[r, c] > img_gray_resized[r, c + 1] else 0)
-    val = 0
-    for b in bits:
-        val = (val << 1) | b
-    return val
-
-def _hamming_distance(h1: int, h2: int) -> int:
-    return bin(h1 ^ h2).count('1')
-
-def _compute_subject_phash(image_path: str) -> int:
+def compute_sift_match_score(screenshot_path: str, candidate_path: str, is_shape: bool = False) -> int:
     """
-    Compute a perceptual hash on the central subject region of an image.
-    For screenshots: crop the subject area (between top UI and bottom text overlay).
-    For clean photos: use the whole image.
+    Computes robust SIFT + RANSAC homography inlier matching score between a screenshot and candidate image.
+    Crops screenshot to the actual post body and shape regions to prevent UI interference.
     """
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
+    try:
+        img_ss = cv2.imread(screenshot_path)
+        img_cand = cv2.imread(candidate_path)
+        if img_ss is None or img_cand is None:
+            return 0
+        h, w = img_ss.shape[:2]
+        ratio = h / max(w, 1)
+        if ratio > 1.3:
+            if is_shape:
+                crop_ss = img_ss[int(h * 0.22):int(h * 0.75), :]
+            else:
+                crop_ss = img_ss[int(h * 0.11):int(h * 0.72), :]
+        else:
+            crop_ss = img_ss
+            
+        sift = cv2.SIFT_create(nfeatures=3000)
+        bf = cv2.BFMatcher(cv2.NORM_L2)
+        
+        kp_ss, des_ss = sift.detectAndCompute(crop_ss, None)
+        kp_c, des_c = sift.detectAndCompute(img_cand, None)
+        if des_ss is None or des_c is None:
+            return 0
+            
+        matches = bf.knnMatch(des_ss, des_c, k=2)
+        good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+        if len(good) < 4:
+            return len(good)
+            
+        src_pts = np.float32([kp_ss[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp_c[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        inliers = int(np.sum(mask)) if mask is not None else len(good)
+        logger.info(f"SIFT match: {os.path.basename(screenshot_path)} vs {os.path.basename(candidate_path)} (is_shape={is_shape}): {inliers} inliers")
+        return inliers
+    except Exception as e:
+        logger.warning(f"Error computing SIFT score {os.path.basename(screenshot_path)} vs {os.path.basename(candidate_path)}: {e}")
         return 0
-    h, w = img.shape
-    # Heuristic: if image is taller than wide (portrait/phone screenshot ratio > 1.5)
-    # treat it as a screenshot and crop to the subject area only
-    ratio = h / max(w, 1)
-    if ratio > 1.5:
-        # Screenshot: subject photo is roughly between 12% and 68% from top
-        crop = img[int(h * 0.12):int(h * 0.68), :]
-    else:
-        crop = img
-    # Resize to 9x8 for dHash computation
-    resized = cv2.resize(crop, (9, 8), interpolation=cv2.INTER_AREA)
-    return _phash(resized)
 
-def match_screenshot_to_images(screenshot_path: str, candidate_paths: list) -> str:
+def match_screenshot_to_images(screenshot_path: str, candidate_paths: list, is_shape: bool = False) -> str:
     """
-    Finds the best matching clean photo for a given screenshot using perceptual hashing (dHash).
-    pHash works far better than ORB for matching the same person across different media crops,
-    compressions, and aspect ratios.
+    Finds the best matching clean photo for a given screenshot using OpenCV SIFT feature matching.
+    SIFT is scale-invariant, rotation-invariant, and lighting-invariant, perfectly matching
+    differently cropped and resized photos from social media screenshots.
     """
     if not candidate_paths:
         return None
     if len(candidate_paths) == 1:
         return candidate_paths[0]
 
-    try:
-        ss_hash = _compute_subject_phash(screenshot_path)
-        if ss_hash == 0:
-            return candidate_paths[0]
+    best_candidate = candidate_paths[0]
+    best_score = -1
+    for c_path in candidate_paths:
+        score = compute_sift_match_score(screenshot_path, c_path, is_shape=is_shape)
+        if score > best_score:
+            best_score = score
+            best_candidate = c_path
 
-        best_candidate = candidate_paths[0]
-        best_distance = 999
-
-        for c_path in candidate_paths:
-            c_hash = _compute_subject_phash(c_path)
-            if c_hash == 0:
-                continue
-            dist = _hamming_distance(ss_hash, c_hash)
-            logger.info(f"pHash dist {os.path.basename(screenshot_path)} vs {os.path.basename(c_path)}: {dist}")
-            if dist < best_distance:
-                best_distance = dist
-                best_candidate = c_path
-
-        return best_candidate
-    except Exception as e:
-        logger.warning(f"Error in match_screenshot_to_images: {e}")
-        return candidate_paths[0]
+    return best_candidate
 
 def get_rendered_textbox_keyboard(font_choice: str = "faith") -> InlineKeyboardMarkup:
     """Build the inline keyboard shown after a text box is rendered."""
@@ -4308,6 +4307,19 @@ async def shape_position_callback(update: Update, context: ContextTypes.DEFAULT_
     elif action == "switch_shape_2":
         context.user_data["active_shape_editing"] = 2
     elif action == "done":
+        # If inside a No-Dependency batch session, save positioning and return to post review
+        if "nodep_session" in context.user_data and context.user_data["nodep_session"].get("queue"):
+            sess = context.user_data["nodep_session"]
+            curr_idx = sess.get("current_idx", 0)
+            if curr_idx < len(sess["queue"]):
+                post = sess["queue"][curr_idx]
+                post["shape_offset_x"] = context.user_data.get("shape_offset_x", 0)
+                post["shape_offset_y"] = context.user_data.get("shape_offset_y", 0)
+                post["shape_scale"] = context.user_data.get("shape_scale", 1.0)
+            await query.message.edit_reply_markup(reply_markup=None)
+            await query.message.reply_text("✅ 3D position saved!")
+            return await nodep_render_and_display_current(query.message, context)
+
         font_choice = context.user_data.get("chosen_font", "faith")
         img_bytes = context.user_data.get("last_rendered_image_bytes") or context.user_data.get("transparent_png_bytes")
         bg_path = context.user_data.pop("temp_bg_path", None)
@@ -5140,6 +5152,17 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
             raw_ocr = await asyncio.to_thread(call_ocr_space, img_bytes)
             headline = await asyncio.to_thread(clean_ocr_headline_with_ai, raw_ocr)
             
+            # If phone aspect ratio (vertical > 1.4) and no headline detected, retry OCR once more
+            if not (headline and len(headline.strip()) >= 15):
+                try:
+                    im_check = cv2.imread(f_path)
+                    if im_check is not None and (im_check.shape[0] / max(im_check.shape[1], 1)) > 1.4:
+                        await asyncio.sleep(1.5)
+                        raw_ocr = await asyncio.to_thread(call_ocr_space, img_bytes)
+                        headline = await asyncio.to_thread(clean_ocr_headline_with_ai, raw_ocr)
+                except Exception:
+                    pass
+
             if headline and len(headline.strip()) >= 15:
                 screenshots.append({"path": f_path, "headline": headline})
             else:
@@ -5182,42 +5205,75 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
         
         ppp = sess.get("photos_per_post", 1)
         queue = []
-        remaining_clean = list(clean_images)
         target_count = max(total_target, len(screenshots))
         
         await safe_edit_status_message(status_msg, f"🔗 Matching {len(screenshots)} screenshot(s) to {len(clean_images)} photo(s)...")
         
+        def get_pixels(p):
+            try:
+                im = cv2.imread(p)
+                return im.shape[0] * im.shape[1] if im is not None else 0
+            except Exception:
+                return 0
+
+        clean_sorted = sorted(clean_images, key=get_pixels, reverse=True)
+        has_shapes = (ppp == 2) or (len(clean_images) >= len(screenshots) * 2)
+
+        if has_shapes and len(clean_sorted) >= 2:
+            n_main = min(len(screenshots), max(1, len(clean_sorted) // 2))
+            main_pool = clean_sorted[:n_main]
+            shape_pool = clean_sorted[n_main:]
+        else:
+            main_pool = list(clean_sorted)
+            shape_pool = []
+
+        # Optimal bipartite matching for Main Backgrounds (Hungarian Algorithm)
+        matched_bgs = {}
+        if main_pool and screenshots:
+            n_ss = len(screenshots)
+            n_m = len(main_pool)
+            cost_matrix = np.zeros((n_ss, n_m))
+            for i, ss in enumerate(screenshots):
+                for j, m_img in enumerate(main_pool):
+                    score = await asyncio.to_thread(compute_sift_match_score, ss["path"], m_img, False)
+                    cost_matrix[i, j] = -score
+            r_ind, c_ind = linear_sum_assignment(cost_matrix)
+            for r, c in zip(r_ind, c_ind):
+                matched_bgs[r] = main_pool[c]
+            # Fill any unassigned screenshots if n_ss > n_m
+            for i in range(n_ss):
+                if i not in matched_bgs:
+                    best_j = int(np.argmin(cost_matrix[i]))
+                    matched_bgs[i] = main_pool[best_j]
+
+        # Optimal bipartite matching for Shape Cutouts (Hungarian Algorithm)
+        matched_shapes = {}
+        if shape_pool and screenshots:
+            n_ss = len(screenshots)
+            n_s = len(shape_pool)
+            cost_matrix_s = np.zeros((n_ss, n_s))
+            for i, ss in enumerate(screenshots):
+                for j, s_img in enumerate(shape_pool):
+                    score = await asyncio.to_thread(compute_sift_match_score, ss["path"], s_img, True)
+                    cost_matrix_s[i, j] = -score
+            r_s, c_s = linear_sum_assignment(cost_matrix_s)
+            for r, c in zip(r_s, c_s):
+                matched_shapes[r] = shape_pool[c]
+            # Fill any unassigned screenshots if n_ss > n_s
+            for i in range(n_ss):
+                if i not in matched_shapes:
+                    best_j = int(np.argmin(cost_matrix_s[i]))
+                    matched_shapes[i] = shape_pool[best_j]
+
         for idx in range(target_count):
-            ss_item = screenshots[idx % len(screenshots)]
+            ss_idx = idx % len(screenshots)
+            ss_item = screenshots[ss_idx]
             ss_path = ss_item["path"]
             headline = ss_item["headline"]
             
-            matched_bg = None
-            matched_shape = None
+            matched_bg = matched_bgs.get(ss_idx) or (clean_sorted[0] if clean_sorted else ss_path)
+            matched_shape = matched_shapes.get(ss_idx)
             
-            if ppp == 2 and len(clean_images) >= (idx + 1) * 2:
-                # Direct sequence pair for this post: [main, shape]
-                matched_bg = clean_images[idx * 2]
-                matched_shape = clean_images[idx * 2 + 1]
-                if matched_bg in remaining_clean:
-                    remaining_clean.remove(matched_bg)
-                if matched_shape in remaining_clean:
-                    remaining_clean.remove(matched_shape)
-            else:
-                if not remaining_clean:
-                    remaining_clean = list(clean_images)
-                matched_bg = match_screenshot_to_images(ss_path, remaining_clean)
-                if matched_bg in remaining_clean:
-                    remaining_clean.remove(matched_bg)
-                    
-                if ppp == 2:
-                    if remaining_clean:
-                        matched_shape = remaining_clean.pop(0)
-                    elif len(clean_images) > 1:
-                        other_imgs = [c for c in clean_images if c != matched_bg]
-                        if other_imgs:
-                            matched_shape = other_imgs[0]
-                            
             style = style_list[idx % len(style_list)]
             color = charlie_colors[idx % len(charlie_colors)] if style == "charlie" else maga_colors[idx % len(maga_colors)]
             
