@@ -94,6 +94,7 @@ start_health_servers()
 
 import logging
 import urllib.request
+import subprocess
 import argparse
 import asyncio
 import base64
@@ -816,7 +817,25 @@ async def safe_reply_caption(target_message, caption_text: str):
         logger.error(f"Error sending caption: {e}")
 
 def call_ocr_space(image_bytes: bytes) -> str:
-    """Extract text from image bytes using OCR.space API with automatic retries."""
+    """Extract text from image bytes using fast local native Vision OCR if available, falling back to OCR.space."""
+    mac_ocr_bin = os.path.join(BASE_DIR, "mac_ocr")
+    if os.path.exists(mac_ocr_bin):
+        tmp_path = os.path.join("/tmp", f"ocr_{uuid.uuid4().hex[:8]}.jpg")
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(image_bytes)
+            res = subprocess.run([mac_ocr_bin, tmp_path], capture_output=True, text=True, timeout=5)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+        except Exception as e:
+            logger.warning(f"Local mac_ocr error: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
     url = "https://api.ocr.space/parse/image"
     api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld")
     payload = {
@@ -1030,6 +1049,35 @@ def compute_sift_match_score(screenshot_path: str, candidate_path: str, is_shape
     except Exception as e:
         logger.warning(f"Error computing SIFT score {os.path.basename(screenshot_path)} vs {os.path.basename(candidate_path)}: {e}")
         return 0
+
+def compute_shape_match_score(screenshot_path: str, candidate_path: str) -> float:
+    """
+    Computes robust matching score for small shape cutouts/badges inside screenshots.
+    Uses multi-scale normalized cross-correlation template matching across the post region.
+    """
+    try:
+        img_ss = cv2.imread(screenshot_path)
+        img_cand = cv2.imread(candidate_path)
+        if img_ss is None or img_cand is None:
+            return 0.0
+        h, w = img_ss.shape[:2]
+        crop = img_ss[int(h * 0.30):int(h * 0.78), :]
+        best_score = 0.0
+        th, tw = img_cand.shape[:2]
+        for s in np.linspace(0.12, 0.85, 16):
+            rw, rh = int(tw * s), int(th * s)
+            if rh >= crop.shape[0] or rw >= crop.shape[1] or rh < 10 or rw < 10:
+                continue
+            resized = cv2.resize(img_cand, (rw, rh))
+            res = cv2.matchTemplate(crop, resized, cv2.TM_CCOEFF_NORMED)
+            score = float(np.max(res))
+            if score > best_score:
+                best_score = score
+        logger.info(f"Shape template match: {os.path.basename(screenshot_path)} vs {os.path.basename(candidate_path)}: {best_score:.3f}")
+        return best_score
+    except Exception as e:
+        logger.warning(f"Error computing shape match score: {e}")
+        return 0.0
 
 def match_screenshot_to_images(screenshot_path: str, candidate_paths: list, is_shape: bool = False) -> str:
     """
@@ -5246,7 +5294,7 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
                     best_j = int(np.argmin(cost_matrix[i]))
                     matched_bgs[i] = main_pool[best_j]
 
-        # Optimal bipartite matching for Shape Cutouts (Hungarian Algorithm)
+        # Optimal bipartite matching for Shape Cutouts (Template Matching + Hungarian Algorithm)
         matched_shapes = {}
         if shape_pool and screenshots:
             n_ss = len(screenshots)
@@ -5254,7 +5302,7 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
             cost_matrix_s = np.zeros((n_ss, n_s))
             for i, ss in enumerate(screenshots):
                 for j, s_img in enumerate(shape_pool):
-                    score = await asyncio.to_thread(compute_sift_match_score, ss["path"], s_img, True)
+                    score = await asyncio.to_thread(compute_shape_match_score, ss["path"], s_img)
                     cost_matrix_s[i, j] = -score
             r_s, c_s = linear_sum_assignment(cost_matrix_s)
             for r, c in zip(r_s, c_s):
@@ -5289,7 +5337,9 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
                 "headline": headline,
                 "bg_path": matched_bg,
                 "shape_path": matched_shape,
-                "shape_offset_x": 0,
+                "shape_offset_x": -260,
+                "shape_offset_y": 40,
+                "shape_scale": 1.0,
                 "shape_offset_y": 0,
                 "shape_scale": 1.0,
                 "clean_candidates": list(clean_images),
