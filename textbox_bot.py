@@ -97,6 +97,7 @@ import urllib.request
 import argparse
 import asyncio
 import base64
+import re
 from io import BytesIO
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
