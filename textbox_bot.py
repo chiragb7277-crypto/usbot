@@ -982,45 +982,72 @@ def search_wikimedia_image(query: str) -> str:
         
     return None
 
+def _phash(img_gray_resized) -> int:
+    """Compute a 64-bit perceptual hash (dHash) for a grayscale image already resized to 9x8."""
+    rows, cols = img_gray_resized.shape
+    bits = []
+    for r in range(rows):
+        for c in range(cols - 1):
+            bits.append(1 if img_gray_resized[r, c] > img_gray_resized[r, c + 1] else 0)
+    val = 0
+    for b in bits:
+        val = (val << 1) | b
+    return val
+
+def _hamming_distance(h1: int, h2: int) -> int:
+    return bin(h1 ^ h2).count('1')
+
+def _compute_subject_phash(image_path: str) -> int:
+    """
+    Compute a perceptual hash on the central subject region of an image.
+    For screenshots: crop the subject area (between top UI and bottom text overlay).
+    For clean photos: use the whole image.
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return 0
+    h, w = img.shape
+    # Heuristic: if image is taller than wide (portrait/phone screenshot ratio > 1.5)
+    # treat it as a screenshot and crop to the subject area only
+    ratio = h / max(w, 1)
+    if ratio > 1.5:
+        # Screenshot: subject photo is roughly between 12% and 68% from top
+        crop = img[int(h * 0.12):int(h * 0.68), :]
+    else:
+        crop = img
+    # Resize to 9x8 for dHash computation
+    resized = cv2.resize(crop, (9, 8), interpolation=cv2.INTER_AREA)
+    return _phash(resized)
+
 def match_screenshot_to_images(screenshot_path: str, candidate_paths: list) -> str:
-    """Finds the best matching clean photo for a given screenshot using OpenCV ORB feature similarity."""
+    """
+    Finds the best matching clean photo for a given screenshot using perceptual hashing (dHash).
+    pHash works far better than ORB for matching the same person across different media crops,
+    compressions, and aspect ratios.
+    """
     if not candidate_paths:
         return None
     if len(candidate_paths) == 1:
         return candidate_paths[0]
-        
+
     try:
-        img_ss = cv2.imread(screenshot_path, cv2.IMREAD_GRAYSCALE)
-        if img_ss is None:
+        ss_hash = _compute_subject_phash(screenshot_path)
+        if ss_hash == 0:
             return candidate_paths[0]
-            
-        h, w = img_ss.shape
-        # Crop central graphic area where the person/subject photo usually is
-        ss_crop = img_ss[int(h * 0.12):int(h * 0.68), :]
-        
-        orb = cv2.ORB_create(nfeatures=1200)
-        kp_ss, des_ss = orb.detectAndCompute(ss_crop, None)
-        if des_ss is None:
-            return candidate_paths[0]
-            
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        best_score = -1
+
         best_candidate = candidate_paths[0]
-        
+        best_distance = 999
+
         for c_path in candidate_paths:
-            img_c = cv2.imread(c_path, cv2.IMREAD_GRAYSCALE)
-            if img_c is None:
+            c_hash = _compute_subject_phash(c_path)
+            if c_hash == 0:
                 continue
-            kp_c, des_c = orb.detectAndCompute(img_c, None)
-            if des_c is None:
-                continue
-            matches = bf.match(des_ss, des_c)
-            good_matches = [m for m in matches if m.distance < 60]
-            score = len(good_matches)
-            if score > best_score:
-                best_score = score
+            dist = _hamming_distance(ss_hash, c_hash)
+            logger.info(f"pHash dist {os.path.basename(screenshot_path)} vs {os.path.basename(c_path)}: {dist}")
+            if dist < best_distance:
+                best_distance = dist
                 best_candidate = c_path
-                
+
         return best_candidate
     except Exception as e:
         logger.warning(f"Error in match_screenshot_to_images: {e}")
@@ -1068,11 +1095,11 @@ async def safe_delete_message(msg):
         except Exception as e:
             logger.debug(f"Could not delete message (safe to ignore): {e}")
 
-async def safe_edit_status_message(status_msg, text: str):
+async def safe_edit_status_message(status_msg, text: str, parse_mode: str = None):
     """Safely edit a status message, catching any timeout or Telegram error."""
     if status_msg is not None:
         try:
-            await status_msg.edit_text(text)
+            await status_msg.edit_text(text, parse_mode=parse_mode)
         except Exception as e:
             logger.warning(f"Could not edit status message (already deleted or timed out): {e}")
 
@@ -4990,48 +5017,53 @@ async def nodep_custom_counts_text(update: Update, context: ContextTypes.DEFAULT
     return STATE_NODEP_DUMP
 
 async def nodep_file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Collects dumped media files in No-Dependency mode with concurrency safety."""
+    """Collects dumped media files in No-Dependency mode. Keeps a single live counter message."""
     user_id = update.effective_user.id
     sess = context.user_data.setdefault("nodep_session", {"files": [], "count_charlie": 1, "count_maga": 1})
-    
+
     photo_file = None
     if update.message.photo:
         photo_file = await update.message.photo[-1].get_file()
     elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
         photo_file = await update.message.document.get_file()
-        
+
     if not photo_file:
         return STATE_NODEP_DUMP
-        
+
     save_dir = os.path.join(BASE_DIR, "scratch", f"nodep_{user_id}")
     os.makedirs(save_dir, exist_ok=True)
-    
-    # Generate collision-free filename with UUID and millisecond timestamp
+
+    # Collision-free filename: timestamp + short uuid
     unique_name = f"dump_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}.jpg"
     file_path = os.path.join(save_dir, unique_name)
     await photo_file.download_to_drive(file_path)
-    
+
     async with _nodep_download_lock:
         file_list = sess.setdefault("files", [])
         if file_path not in file_list:
             file_list.append(file_path)
         count = len(file_list)
-        
+
     dump_kb = [
         [InlineKeyboardButton(f"⚡ Start Assembly ({count} files received)", callback_data="nodep_action:start_assembly")],
         [InlineKeyboardButton("❌ Cancel Batch", callback_data="nodep_action:cancel")]
     ]
-    
-    # Cleanly remove the prior count prompt if possible to prevent chat flooding
+
+    # Edit the single counter message in-place instead of sending new messages for every file
     prev_msg = sess.get("last_dump_msg")
     if prev_msg:
         try:
-            await prev_msg.delete()
+            await prev_msg.edit_text(
+                f"📥 **{count} file{'s' if count > 1 else ''} received!** Keep sending — tap Start Assembly when done.",
+                reply_markup=InlineKeyboardMarkup(dump_kb),
+                parse_mode="Markdown"
+            )
+            return STATE_NODEP_DUMP
         except Exception:
-            pass
-            
+            pass  # Message may have been deleted or is too old; fall through to send new
+
     sent_msg = await update.message.reply_text(
-        f"📥 **File #{count} received!** Keep sending more files, or click Start Assembly when finished.",
+        f"📥 **{count} file{'s' if count > 1 else ''} received!** Keep sending — tap Start Assembly when done.",
         reply_markup=InlineKeyboardMarkup(dump_kb),
         parse_mode="Markdown"
     )
@@ -5116,7 +5148,10 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
         
         queue = []
         remaining_clean = list(clean_images)
+        # Build exactly as many posts as the user asked for, cycling screenshots if fewer than target
         target_count = max(total_target, len(screenshots))
+        
+        await safe_edit_status_message(status_msg, f"🔗 Matching {len(screenshots)} screenshot(s) to {len(clean_images)} photo(s)...")
         
         for idx in range(target_count):
             ss_item = screenshots[idx % len(screenshots)]
@@ -5134,6 +5169,11 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
             style = style_list[idx % len(style_list)]
             color = charlie_colors[idx % len(charlie_colors)] if style == "charlie" else maga_colors[idx % len(maga_colors)]
             
+            logger.info(
+                f"Queue[{idx}]: style={style} | color={color} | "
+                f"ss={os.path.basename(ss_path)} -> bg={os.path.basename(matched_bg)}"
+            )
+            
             queue.append({
                 "style": style,
                 "color": color,
@@ -5148,6 +5188,17 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
         sess["clean_images"] = clean_images
         sess["screenshots"] = screenshots
         
+        # Show the user a summary of what was matched before rendering starts
+        summary_lines = [f"✅ **{len(screenshots)} screenshot(s), {len(clean_images)} photo(s) — {len(queue)} posts queued**\n"]
+        for i, entry in enumerate(queue):
+            summary_lines.append(
+                f"• Post {i+1}: **{entry['style'].upper()}** | {entry['color'].capitalize()} | "
+                f"BG: `{os.path.basename(entry['bg_path'])}`"
+            )
+        summary_lines.append("\n_Rendering now…_")
+        await safe_edit_status_message(status_msg, "\n".join(summary_lines), parse_mode="Markdown")
+        
+        await asyncio.sleep(1.5)  # Let user read the summary briefly
         await safe_delete_message(status_msg)
         return await nodep_render_and_display_current(target_msg, context)
         
@@ -5283,17 +5334,38 @@ async def nodep_review_callback(update: Update, context: ContextTypes.DEFAULT_TY
     elif action == "swap_image":
         clean_images = sess.get("clean_images", [])
         if not clean_images:
-            await query.message.reply_text("⚠️ No alternative clean images found in this dump. You can send a new photo directly to use as background!")
+            await query.message.reply_text("⚠️ No alternative clean images found in this dump. Send any photo directly to replace the background!")
             return STATE_NODEP_REVIEW
-            
-        swap_kb = []
-        for i, c_path in enumerate(clean_images):
-            swap_kb.append([InlineKeyboardButton(f"🖼️ Use Image #{i + 1}", callback_data=f"nodep_setimg:{i}")])
-        swap_kb.append([InlineKeyboardButton("🔙 Back to Review", callback_data="nodep_act:back")])
-        
+
+        # Send each clean photo as a visual thumbnail so the user can see what they're picking
         await query.message.reply_text(
-            f"🔄 **Choose a replacement image for Post {idx + 1}:**\n(Or send any new photo directly to replace it)",
-            reply_markup=InlineKeyboardMarkup(swap_kb)
+            f"🔄 **Choose a replacement photo for Post {idx + 1}:**\n"
+            "_Tap 'Use This Photo ✅' under the one you want, or send any new photo directly._",
+            parse_mode="Markdown"
+        )
+        for i, c_path in enumerate(clean_images):
+            is_current = (c_path == post.get("bg_path"))
+            label = f"{'✅ Currently used — switch to this' if is_current else f'Use this photo ({i+1}/{len(clean_images)})'}"
+            try:
+                with open(c_path, "rb") as img_f:
+                    await query.message.reply_photo(
+                        photo=img_f,
+                        caption=f"📸 Photo {i + 1}/{len(clean_images)}",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton(label, callback_data=f"nodep_setimg:{i}")
+                        ]])
+                    )
+            except Exception as e:
+                logger.warning(f"Could not send swap preview for {c_path}: {e}")
+                await query.message.reply_text(
+                    f"Photo {i + 1}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(label, callback_data=f"nodep_setimg:{i}")
+                    ]])
+                )
+        await query.message.reply_text(
+            "🔙 Tap the button under any photo above to use it.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back (keep current)", callback_data="nodep_act:back")]])
         )
         return STATE_NODEP_REVIEW
         
