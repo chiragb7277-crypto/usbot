@@ -697,49 +697,14 @@ def generate_post_caption(template_type: str = "charlie", image_bytes: bytes = N
             "Output only the final 5-sentence caption and 5 hashtags."
         )
     
-    # 1. Try Gemini API with image if key available
-    api_key = os.getenv("GEMINI_API_KEY")
-    if api_key and api_key != "YOUR_GEMINI_API_KEY":
-        try:
-            model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-            parts = [{"text": prompt}]
-            if image_bytes:
-                encoded_image = base64.b64encode(image_bytes).decode("utf-8")
-                mime_type = "image/png" if image_bytes.startswith(b"\x89PNG") else "image/jpeg"
-                parts.append({
-                    "inline_data": {
-                        "mime_type": mime_type,
-                        "data": encoded_image
-                    }
-                })
-            elif text_content:
-                parts.append({"text": f"Post content / quote:\n{text_content}"})
-                
-            payload = {"contents": [{"parts": parts}]}
-            response = requests.post(url, json=payload, timeout=20)
-            if response.status_code == 200:
-                data = response.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts_out = candidates[0].get("content", {}).get("parts", [])
-                    if parts_out and "text" in parts_out[0]:
-                        res_text = parts_out[0]["text"].strip()
-                        if res_text and not is_ai_refusal(res_text):
-                            return res_text
-            else:
-                logger.warning(f"Gemini caption generation returned {response.status_code}: {response.text}")
-        except Exception as e:
-            logger.error(f"Error during Gemini caption generation: {e}")
-
-    # 2. Try Groq API fallback
+    # 1. Try Groq API first (ultra-fast <1s responses with Llama 3.3)
     groq_key = os.getenv("GROQ_API_KEY")
     if groq_key:
         models_to_try = [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
             "qwen/qwen3.8-27b",
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-            "llama-3.3-70b-versatile"
+            "openai/gpt-oss-120b"
         ]
         if os.getenv("GROQ_MODEL"):
             models_to_try.insert(0, os.getenv("GROQ_MODEL"))
@@ -768,7 +733,7 @@ def generate_post_caption(template_type: str = "charlie", image_bytes: bytes = N
                 "temperature": 0.7
             }
             try:
-                response = requests.post(url, headers=headers, json=payload, timeout=15)
+                response = requests.post(url, headers=headers, json=payload, timeout=12)
                 if response.status_code == 200:
                     res_data = response.json()
                     content = res_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
@@ -780,6 +745,39 @@ def generate_post_caption(template_type: str = "charlie", image_bytes: bytes = N
                     logger.warning(f"Groq model {g_model} returned {response.status_code}: {response.text}")
             except Exception as e:
                 logger.error(f"Error calling Groq model {g_model} for caption: {e}")
+
+    # 2. Try Gemini API fallback
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key and api_key != "YOUR_GEMINI_API_KEY":
+        try:
+            model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            parts = [{"text": prompt}]
+            if image_bytes:
+                encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+                mime_type = "image/png" if image_bytes.startswith(b"\x89PNG") else "image/jpeg"
+                parts.append({
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": encoded_image
+                    }
+                })
+            elif text_content:
+                parts.append({"text": f"Post content / quote:\n{text_content}"})
+                
+            payload = {"contents": [{"parts": parts}]}
+            response = requests.post(url, json=payload, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts_out = candidates[0].get("content", {}).get("parts", [])
+                    if parts_out and "text" in parts_out[0]:
+                        res_text = parts_out[0]["text"].strip()
+                        if res_text and not is_ai_refusal(res_text):
+                            return res_text
+        except Exception as e:
+            logger.error(f"Error during Gemini caption generation: {e}")
 
     # Safe hardcoded fallback if all AI services fail
     if is_maga:
@@ -2048,6 +2046,7 @@ STATE_NODEP_COUNTS = 20
 STATE_NODEP_DUMP = 21
 STATE_NODEP_REVIEW = 22
 STATE_NODEP_EDIT_TEXT = 23
+STATE_MANUAL_CAPTION = 24
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Entry point: Greet user and offer font styles."""
@@ -5378,12 +5377,8 @@ async def nodep_render_and_display_current(target_msg, context: ContextTypes.DEF
     idx = sess.get("current_idx", 0)
     
     if idx >= len(queue):
-        # All done!
-        await target_msg.reply_text(
-            f"🎉 **Batch Complete!** All {len(queue)} graphics have been assembled and approved.\n\n"
-            "Send /nodependency to start another batch, or send text anytime for single graphics!"
-        )
-        return STATE_WAITING_TEXT
+        # All done! Deliver final outcome graphics and captions
+        return await nodep_deliver_all_final(target_msg, context)
         
     post = queue[idx]
     style = post["style"]
@@ -5629,11 +5624,7 @@ async def nodep_review_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return await nodep_render_and_display_current(query.message, context)
         
     elif action == "finish":
-        await query.message.reply_text(
-            f"💾 **Batch Saved!** All approved graphics have been generated.\n\n"
-            "Ready for more content? Send /nodependency or send text directly!"
-        )
-        return STATE_WAITING_TEXT
+        return await nodep_deliver_all_final(query.message, context)
         
     elif action == "back":
         return await nodep_render_and_display_current(query.message, context)
@@ -5746,6 +5737,157 @@ async def nodep_edited_text_received(update: Update, context: ContextTypes.DEFAU
         
     return STATE_NODEP_REVIEW
 
+async def nodep_deliver_all_final(target_msg, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Delivers all final approved graphics in the batch alongside their AI-generated Instagram captions."""
+    sess = context.user_data.get("nodep_session", {})
+    queue = sess.get("queue", [])
+    
+    if not queue:
+        await target_msg.reply_text("Batch finished! Send /nodependency to start another, or /caption to caption any photo.")
+        return STATE_WAITING_TEXT
+        
+    status = await target_msg.reply_text(f"🚀 **Finalizing {len(queue)} batch graphics & generating Instagram captions...**")
+    
+    try:
+        for i, post in enumerate(queue):
+            rendered_bytes = post.get("rendered_bytes")
+            if not rendered_bytes:
+                # Re-render if missing
+                tb_buf, lb = await asyncio.to_thread(generate_textbox_image, post["headline"], post["style"], post["color"])
+                has_sh = bool(post.get("shape_path") and os.path.exists(post["shape_path"]))
+                hl_color = get_highlight_color(post["color"])
+                stype = "square" if post["style"] == "maga" else "circle"
+                comp = await asyncio.to_thread(
+                    overlay_png_on_image,
+                    post["bg_path"], tb_buf.getvalue(),
+                    shape_image_path=post.get("shape_path") if has_sh else None,
+                    shape_type=stype,
+                    border_color=hl_color,
+                    shape_offset_x=post.get("shape_offset_x", -260),
+                    shape_offset_y=post.get("shape_offset_y", 40),
+                    shape_scale=post.get("shape_scale", 1.0),
+                    simple_overlay=not has_sh,
+                    line_bottom=lb
+                )
+                rendered_bytes = comp.getvalue()
+                post["rendered_bytes"] = rendered_bytes
+
+            # Generate Instagram caption
+            headline = post.get("headline", "")
+            style = post.get("style", "charlie")
+            caption_text = await asyncio.to_thread(
+                generate_post_caption,
+                template_type=style,
+                image_bytes=rendered_bytes,
+                text_content=headline
+            )
+            
+            post_header = f"✨ **Post {i + 1}/{len(queue)} ({style.upper()} - {post.get('color', '').capitalize()}):**"
+            full_caption = f"{post_header}\n\n{caption_text}"
+            
+            if len(full_caption) <= 1020:
+                await target_msg.reply_photo(
+                    photo=rendered_bytes,
+                    caption=full_caption,
+                    parse_mode="Markdown"
+                )
+            else:
+                await target_msg.reply_photo(
+                    photo=rendered_bytes,
+                    caption=post_header,
+                    parse_mode="Markdown"
+                )
+                await target_msg.reply_text(
+                    caption_text,
+                    parse_mode="Markdown"
+                )
+            
+            await asyncio.sleep(0.5)
+
+        await safe_delete_message(status)
+        await target_msg.reply_text(
+            f"🎉 **Batch Complete!** All {len(queue)} final graphics have been delivered with ready-to-post captions.\n\n"
+            "• Send /nodependency to start another batch\n"
+            "• Send /caption to get captions for any image\n"
+            "• Send text anytime for single graphics!"
+        )
+    except Exception as e:
+        logger.error(f"Error in nodep_deliver_all_final: {e}")
+        await safe_edit_status_message(status, f"❌ Error delivering final batch: {e}")
+
+    context.user_data.pop("nodep_session", None)
+    return STATE_WAITING_TEXT
+
+async def manual_caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for /caption or /captions: allows user to send final images to get captions."""
+    await update.message.reply_text(
+        "✍️ **Manual Caption Mode Active!**\n\n"
+        "Send any final graphic(s) or photo(s) here, and I will generate an Instagram caption (5 sentences + 5 hashtags) based on the image.\n\n"
+        "_Send as many photos as you want. Send /done or tap below when finished._",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Exit Caption Mode", callback_data="exit_caption_mode")]])
+    )
+    return STATE_MANUAL_CAPTION
+
+async def manual_caption_image_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Processes images received in manual caption mode, runs OCR to extract headline, and returns caption."""
+    photo_file = None
+    if update.message.photo:
+        photo_file = await update.message.photo[-1].get_file()
+    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
+        photo_file = await update.message.document.get_file()
+        
+    if not photo_file:
+        return STATE_MANUAL_CAPTION
+
+    status = await update.message.reply_text("🔍 Analyzing image & writing caption...")
+    
+    try:
+        bio = BytesIO()
+        await photo_file.download_to_memory(bio)
+        img_bytes = bio.getvalue()
+        
+        # 1. Extract text from image using local Apple Vision OCR / OCR.space
+        raw_text = await asyncio.to_thread(call_ocr_space, img_bytes)
+        headline = await asyncio.to_thread(clean_ocr_headline_with_ai, raw_text) if raw_text else ""
+        
+        # 2. Determine post style (MAGA if red / MAGA keywords, else Charlie)
+        template_type = "maga" if ("maga" in raw_text.lower() or "trump" in raw_text.lower()) else "charlie"
+        
+        # 3. Generate caption
+        caption = await asyncio.to_thread(
+            generate_post_caption,
+            template_type=template_type,
+            image_bytes=img_bytes,
+            text_content=headline or raw_text
+        )
+        
+        await safe_delete_message(status)
+        
+        reply_msg = f"📝 **Caption:**\n\n{caption}"
+        if headline:
+            reply_msg = f"📌 **Detected Text:** `{headline.replace(chr(10), ' ')}`\n\n" + reply_msg
+
+        await update.message.reply_text(
+            reply_msg,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Exit Caption Mode", callback_data="exit_caption_mode")]])
+        )
+    except Exception as e:
+        logger.error(f"Error in manual_caption_image_received: {e}")
+        await safe_edit_status_message(status, f"❌ Failed to generate caption: {e}")
+        
+    return STATE_MANUAL_CAPTION
+
+async def exit_caption_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Exits manual caption mode back to standard bot state."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text("✅ Exited caption mode. You can now send text or commands anytime!")
+    elif update.message:
+        await update.message.reply_text("✅ Exited caption mode. You can now send text or commands anytime!")
+    return STATE_WAITING_TEXT
+
 def main():
     parser = argparse.ArgumentParser(description="TextBox Telegram Bot")
     parser.add_argument("--test-render", action="store_true", help="Generate test rendering images and exit")
@@ -5810,6 +5952,8 @@ def main():
             CommandHandler("nodependency", nodependency_command),
             CommandHandler("batch", nodependency_command),
             CommandHandler("dump", nodependency_command),
+            CommandHandler("caption", manual_caption_command),
+            CommandHandler("captions", manual_caption_command),
             MessageHandler(filters.TEXT & ~filters.COMMAND, text_received),
             MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_received)
         ],
@@ -5829,6 +5973,8 @@ def main():
                 CommandHandler("nodependency", nodependency_command),
                 CommandHandler("batch", nodependency_command),
                 CommandHandler("dump", nodependency_command),
+                CommandHandler("caption", manual_caption_command),
+                CommandHandler("captions", manual_caption_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, text_received),
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, image_received),
                 CallbackQueryHandler(change_color, pattern="^recolor:"),
@@ -5928,6 +6074,14 @@ def main():
             ],
             STATE_NODEP_EDIT_TEXT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, nodep_edited_text_received),
+            ],
+            STATE_MANUAL_CAPTION: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, manual_caption_image_received),
+                CallbackQueryHandler(exit_caption_mode, pattern="^exit_caption_mode$"),
+                CommandHandler("done", exit_caption_mode),
+                CommandHandler("cancel", exit_caption_mode),
+                CommandHandler("skip", exit_caption_mode),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, exit_caption_mode),
             ]
         },
         fallbacks=[
@@ -5938,6 +6092,8 @@ def main():
             CommandHandler("nodependency", nodependency_command),
             CommandHandler("batch", nodependency_command),
             CommandHandler("dump", nodependency_command),
+            CommandHandler("caption", manual_caption_command),
+            CommandHandler("captions", manual_caption_command),
         ],
         per_message=False,
     )
