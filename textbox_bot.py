@@ -111,7 +111,8 @@ from emoji_helper import (
     get_apple_emoji_image,
     measure_line_with_emojis,
     draw_text_with_emojis,
-    get_font_cap_metrics
+    get_font_cap_metrics,
+    clean_headline_text
 )
 # NOTE: rembg and onnxruntime are lazy-loaded on demand to keep baseline memory lean (<100MB)
 import requests
@@ -824,7 +825,7 @@ def call_ocr_space(image_bytes: bytes) -> str:
                 f.write(image_bytes)
             res = subprocess.run([mac_ocr_bin, tmp_path], capture_output=True, text=True, timeout=5)
             if res.returncode == 0 and res.stdout.strip():
-                return res.stdout.strip()
+                return clean_headline_text(res.stdout.strip())
         except Exception as e:
             logger.warning(f"Local mac_ocr error: {e}")
         finally:
@@ -854,7 +855,7 @@ def call_ocr_space(image_bytes: bytes) -> str:
                 if results:
                     text = results[0].get("ParsedText", "").strip()
                     if text:
-                        return text
+                        return clean_headline_text(text)
             logger.warning(f"OCR.space attempt {attempt + 1} status code {response.status_code}")
         except Exception as e:
             logger.warning(f"OCR.space attempt {attempt + 1} failed: {e}")
@@ -867,7 +868,7 @@ def clean_ocr_headline_with_ai(raw_text: str) -> str:
         return ""
     groq_key = os.getenv("GROQ_API_KEY")
     if not groq_key:
-        return raw_text.strip()
+        return clean_headline_text(raw_text.strip())
         
     system_prompt = "You are an expert OCR cleaner for social media graphics. Extract ONLY the exact headline text verbatim, removing surrounding UI."
     user_prompt = f"""Raw OCR from a social media screenshot:
@@ -910,7 +911,7 @@ CRITICAL RULES:
             if r.status_code == 200:
                 res = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 if res and res != "NONE" and "NONE" not in res[:10] and not is_ai_refusal(res):
-                    return res
+                    return clean_headline_text(res)
         except Exception as e:
             logger.warning(f"Groq OCR cleanup error with model {model}: {e}")
             continue
@@ -1241,8 +1242,11 @@ def generate_textbox_image(text: str, font_type: str, highlight_choice: str = "y
         
     default_text_color = (255, 255, 255) # Premium white
     
+    # Strip invisible zero-width spaces (\u200b), BOM, control/format characters that cause .notdef box glyphs
+    text = clean_headline_text(text)
+    
     # Parse lines and capitalize all text
-    lines = [line.strip().upper() for line in text.split('\n') if line.strip()]
+    lines = [clean_headline_text(line).strip().upper() for line in text.split('\n') if clean_headline_text(line).strip()]
     if not lines:
         lines = ["TEXT BOX"]
         
@@ -2535,7 +2539,7 @@ async def clear_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Generate and send image upon text reception. User stays on the same page."""
     restore_session_if_needed(update, context)
-    text = update.message.text.strip()
+    text = clean_headline_text(update.message.text.strip())
     user_id = update.effective_user.id
     font_choice = context.user_data.get("chosen_font", "faith")
     if font_choice == "charlie":
@@ -3093,7 +3097,7 @@ async def ig_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def ig_ocr_text_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle text message input when the user edits the OCR text."""
-    text = update.message.text.strip()
+    text = clean_headline_text(update.message.text.strip())
     
     # Run AI proofreading on edited text too!
     corrected_text = await asyncio.to_thread(proofread_text_with_ai, text)
@@ -4439,7 +4443,7 @@ async def instagram_background_callback(update: Update, context: ContextTypes.DE
     
     if not media_path or not os.path.exists(media_path):
         await query.message.edit_text("❌ Instagram background media not found. Please upload a new background.")
-        return STATE_WAITING_BACKGROUND
+        return STATE_WAITING_BACKGROUND 
         
     status_msg = await query.message.reply_text("📥 Processing background and rendering...")
     
@@ -5339,8 +5343,6 @@ async def nodep_start_assembly(update: Update, context: ContextTypes.DEFAULT_TYP
                 "shape_offset_x": -260,
                 "shape_offset_y": 40,
                 "shape_scale": 1.0,
-                "shape_offset_y": 0,
-                "shape_scale": 1.0,
                 "clean_candidates": list(clean_images),
                 "rendered_bytes": None
             })
@@ -5725,7 +5727,7 @@ async def nodep_set_color_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def nodep_edited_text_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handles text input when user edits text on a batch post."""
-    new_text = update.message.text.strip()
+    new_text = clean_headline_text(update.message.text.strip())
     sess = context.user_data.get("nodep_session", {})
     queue = sess.get("queue", [])
     curr_idx = sess.get("current_idx", 0)
