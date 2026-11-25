@@ -1,4 +1,13 @@
-﻿# Templatea Backend API
+﻿---
+title: Usbot
+emoji: 🤖
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+---
+
+# Templatea Backend API
 
 A FastAPI service that wraps the Templatea pipeline for downloading, processing, and rendering Instagram reels. It exposes workspace artifacts, template metadata, and orchestration controls over HTTP + WebSocket.
 
