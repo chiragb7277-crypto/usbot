@@ -36,5 +36,7 @@ test_*.png
 test_*.jpg
 charlie_ocr_test.png
 user_support_*.png
+9to5_reel_bot/assets/fonts/
+9to5_reel_bot/output/
 
 
