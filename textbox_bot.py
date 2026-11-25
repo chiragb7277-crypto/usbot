@@ -26,16 +26,15 @@ import time
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 
 def start_health_servers():
-    """Start HTTP health server for cloud hosting (Render / HF) on PORT or single fallback port 10000."""
+    """Start HTTP health server for cloud hosting (Render / HF / Railway) on PORT or fallback ports (7860, 10000)."""
     port_env = os.environ.get("PORT")
     if port_env:
         try:
             ports_to_bind = [int(port_env)]
         except ValueError:
-            ports_to_bind = [10000]
+            ports_to_bind = [7860, 10000]
     else:
-        # Default single health port when running locally or unconfigured
-        ports_to_bind = [int(os.environ.get("HEALTH_PORT", 10000))]
+        ports_to_bind = [7860, 10000]
 
     class HealthStatusHandler(SimpleHTTPRequestHandler):
         def do_GET(self):
